@@ -26,7 +26,7 @@ STEP_PERIOD = 0.02
 
 
 class Simulator(Node):
-    def __init__(self, *, context=None, shared_world=None):
+    def __init__(self, *, context=None, shared_world=None, command_timeout=0.5):
         super().__init__(
             "alohamini_nav_sim", context=context, enable_rosout=shared_world is None
         )
@@ -55,6 +55,7 @@ class Simulator(Node):
         self.enabled = False
         self.velocity = (0.0, 0.0, 0.0)
         self.last_command = 0.0
+        self.command_timeout = command_timeout
         self.steps = 0
         self.session = "simulation-" + uuid.uuid4().hex
         if shared_world is None:
@@ -78,7 +79,7 @@ class Simulator(Node):
     def requested_velocity(self):
         return (
             self.velocity
-            if self.enabled and time.monotonic() - self.last_command < 0.5
+            if self.enabled and time.monotonic() - self.last_command < self.command_timeout
             else (0.0, 0.0, 0.0)
         )
     def tick(self):

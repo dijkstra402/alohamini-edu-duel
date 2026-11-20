@@ -13,8 +13,13 @@ class GroundStop:
     last_stamp: int = 0
     count: int = 0
     first_ns: int = 0
+    link_lost_s: float | None = None
     stopped_s: float | None = None
     confirmed_s: float | None = None
+
+    def observe_link(self, received_ns, online):
+        if not online and self.link_lost_s is None:
+            self.link_lost_s = (received_ns - self.injected_ns) / 1e9
 
     def observe(self, stamp, received_ns, stationary):
         if stamp <= self.last_stamp:

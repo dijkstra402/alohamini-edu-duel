@@ -54,7 +54,9 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     timed = checks["故障注入到停稳"]
     assert set(timed["双车停稳_s"]) == {"sword_a", "shield_b"}
     assert timed["最迟停稳_s"] == max(timed["双车停稳_s"].values())
-    assert timed["0.5秒内停稳"] == (timed["最迟停稳_s"] <= 0.5)
+    assert timed["最迟停稳_s"] <= 0.5
+    assert timed["0.5秒内停稳"]
+    assert all(0 < value <= 0.5 for value in timed["双车检测断联_s"].values())
     assert checks["断联时雷达仍更新"]
     assert checks["重连"]
     assert checks["有序停机"]
@@ -72,11 +74,15 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
         delay = faults["单向延迟"]
         assert delay["延迟_s"] == 0.75
         assert delay["延迟转发"] >= 3
-        assert all(0 < value < 4 for value in delay["双车停稳_s"].values())
+        assert all(0 < value <= 0.5 for value in delay["双车停稳_s"].values())
+        assert delay["0.5秒内停稳"]
         restart = faults["对端底盘进程重启"]
         assert restart["新进程"] != restart["旧进程"]
         assert restart["新会话"] != restart["旧会话"]
         assert restart["重启后运动默认禁用"]
+        assert restart["最迟停稳_s"] <= 0.5
+        assert restart["0.5秒内停稳"]
+        assert restart["双车检测断联_s"]["shield_b"] is None
     assert (output / "stop_watch.log").is_file()
 
 

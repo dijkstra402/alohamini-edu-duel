@@ -27,8 +27,10 @@ def arena(tmp_path):
 
 def exchange(a, b, now):
     sent_a = a.encode(POSE_A, 0.0, 0.0, now)
-    sent_b = b.encode(POSE_B, 0.0, 0.0, now + 100_000)
-    a.accept(sent_b, now)
+    sent_b = json.loads(b.encode(POSE_B, 0.0, 0.0, now))
+    # 对端报文字段的时钟原点不同，本机只使用自己的发送与接收时间。
+    sent_b["tx_mono_s"] = now + 100_000
+    a.accept(json.dumps(sent_b).encode(), now)
     b.accept(sent_a, now)
     return sent_a
 
@@ -126,6 +128,22 @@ def test_one_way_drop_stops_both_and_requires_recent_acknowledgements(arena):
     exchange(a, b, 0.95)
     assert a.online(0.95) is not None
     assert b.online(0.95) is not None
+
+
+def test_heartbeat_confirmation_expires_from_original_send_time(arena):
+    a, b = (PeerLink(robot, arena) for robot in ROBOT_IDS)
+    for index in range(4):
+        exchange(a, b, index * 0.05)
+    assert a.online(0.39) is not None
+    # 最近接收的是 0.15 秒的位姿，确认对应 0.10 秒发送的报文。
+    assert a.online(0.41) is None
+
+    b.accept(a.encode(POSE_A, 0.0, 0.0, 0.2), 0.2)
+    delayed = b.encode(POSE_B, 0.0, 0.0, 0.2)
+    a.accept(delayed, 0.51)
+    assert a.remote.received_at == 0.51
+    assert a.acked_sent_at == pytest.approx(0.1)
+    assert a.online(0.51) is None
 
 
 def test_receiver_ignores_bad_geometry_and_different_arena(arena):

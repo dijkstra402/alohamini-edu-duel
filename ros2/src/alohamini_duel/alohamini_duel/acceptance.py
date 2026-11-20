@@ -127,6 +127,8 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
 
         def receive(message, domain, robot, topic):
             telemetry[(domain, topic)] = message
+            if topic == "/duel/peer_online" and robot in active_stops:
+                active_stops[robot].observe_link(time.monotonic_ns(), message.data)
             if topic != "/simulation/ground_truth":
                 return
             header = message.header.stamp
@@ -435,21 +437,26 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             for publisher in velocity:
                 publisher.publish(move)
 
+        missed_deadlines = []
+
         def start_timing(injected_ns):
             active_stops.update((robot, GroundStop(injected_ns)) for robot in ROBOT_IDS)
 
         def stopped_with_evidence():
             return all(evidence.stopped_s is not None for evidence in active_stops.values())
 
-        def timing_report():
+        def timing_report(scenario):
             elapsed = {robot: evidence.stopped_s for robot, evidence in active_stops.items()}
             confirmed = {
                 robot: evidence.confirmed_s for robot, evidence in active_stops.items()
             }
+            lost = {robot: evidence.link_lost_s for robot, evidence in active_stops.items()}
             active_stops.clear()
             maximum = max(elapsed.values())
+            if maximum > 0.5:
+                missed_deadlines.append(f"{scenario} {maximum:.3f} 秒")
             return {
-                "双车停稳_s": elapsed, "双车停稳确认_s": confirmed,
+                "双车检测断联_s": lost, "双车停稳_s": elapsed, "双车停稳确认_s": confirmed,
                 "最迟停稳_s": maximum, "0.5秒内停稳": maximum <= 0.5,
             }
 
@@ -509,7 +516,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             lambda: both_offline() and referee_paused() and stopped_with_evidence(),
             4, "断联后底盘或裁判未停", drive,
         )
-        results["故障注入到停稳"] = timing_report()
+        results["故障注入到停稳"] = timing_report("直接断联")
         stopped_at = time.monotonic()
 
         def sustained_stop():
@@ -575,7 +582,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
                 lambda: both_offline() and referee_paused() and stopped_with_evidence(),
                 4, "单向延迟后双车或裁判未停", drive,
             )
-            delay = timing_report()
+            delay = timing_report("单向延迟")
             wait_for(
                 lambda: link.snapshot()["延迟转发"] >= 3,
                 3, "未观察到实际延迟转发", drive,
@@ -596,7 +603,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
                 and referee_paused() and stopped_with_evidence(),
                 6, "对端进程退出后双车或裁判未停", drive,
             )
-            restart = timing_report()
+            restart = timing_report("对端底盘进程退出")
             require(second_base.returncode == -signal.SIGKILL, "对端仿真底盘未被故障信号终止")
             new_base = start_second_base(output / "base_b_restart.log")
             wait_for(
@@ -618,6 +625,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
 
         play_round(scoreboard(domains[0])["round"])
         finish()
+        require(not missed_deadlines, f"停稳超过 0.5 秒。{'、'.join(missed_deadlines)}")
 
 
 def main(argv=None):

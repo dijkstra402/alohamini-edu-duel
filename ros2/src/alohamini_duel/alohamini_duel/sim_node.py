@@ -7,6 +7,7 @@ from alohamini_nav_sim.node import STEP_PERIOD, Simulator
 from rclpy.executors import ExternalShutdownException
 
 from .arena import Arena
+from .cmd_vel_arbiter import COMMAND_TIMEOUT
 from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args, watch_shutdown
 from .shared_sim_world import SharedDuelWorld
 
@@ -21,7 +22,9 @@ def main(args=None):
             attach_domain(
                 resources,
                 domain,
-                lambda context, vehicle=vehicle: Simulator(context=context, shared_world=vehicle),
+                lambda context, vehicle=vehicle: Simulator(
+                    context=context, shared_world=vehicle, command_timeout=COMMAND_TIMEOUT
+                ),
             )
             for vehicle, domain in zip(world.vehicles, arguments.domains, strict=True)
         ]

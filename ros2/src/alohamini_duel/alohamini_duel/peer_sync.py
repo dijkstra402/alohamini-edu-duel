@@ -4,11 +4,13 @@ import json
 import math
 import socket
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from .arena import ROBOT_IDS, Arena, Pose, coordinates
 
 PEER_TIMEOUT = 0.5
+LINK_STOP_TIMEOUT = 0.30
 HEARTBEAT_PERIOD = 0.05
 MAX_PACKET_BYTES = 1024
 
@@ -28,15 +30,19 @@ class PeerLink:
         self.arena = arena
         self.session_id = uuid.uuid4().hex
         self.seq = 0
+        self.sent_at: OrderedDict[int, float] = OrderedDict()
         self.remote: PeerState | None = None
         self.retired_sessions: set[str] = set()
         self.consecutive = 0
         self.ack_seq = 0
-        self.ack_at = -math.inf
+        self.acked_sent_at = -math.inf
         self.ack_consecutive = 0
 
     def encode(self, pose: Pose, vx: float, vy: float, now: float) -> bytes:
         self.seq += 1
+        while self.sent_at and now - self.sent_at[next(iter(self.sent_at))] >= LINK_STOP_TIMEOUT:
+            self.sent_at.popitem(last=False)
+        self.sent_at[self.seq] = now
         return json.dumps(
             {
                 "version": 1,
@@ -96,29 +102,34 @@ class PeerLink:
                 return
             self.retired_sessions.add(previous.session_id)
             self.ack_seq = 0
-            self.ack_at = -math.inf
+            self.acked_sent_at = -math.inf
             self.ack_consecutive = 0
         if previous and session == previous.session_id and seq <= previous.seq:
             return
         self.remote = PeerState(session, seq, pose, now)
-        self.consecutive = min(self.consecutive + 1, 3) if fresh else 1
+        recent_pose = previous is not None and now - previous.received_at < LINK_STOP_TIMEOUT
+        self.consecutive = min(self.consecutive + 1, 3) if recent_pose else 1
+        sent = self.sent_at.get(ack_seq)
         if (
             confirmed_session == self.session_id
-            and self.ack_seq < ack_seq <= self.seq
-            and (self.seq - ack_seq) * HEARTBEAT_PERIOD < PEER_TIMEOUT
+            and self.ack_seq < ack_seq
+            and sent is not None
+            and now - sent < LINK_STOP_TIMEOUT
         ):
+            # 迟到的确认不能从接收时刻重新延长运动许可。
             self.ack_consecutive = (
-                min(self.ack_consecutive + 1, 3) if now - self.ack_at < PEER_TIMEOUT else 1
+                min(self.ack_consecutive + 1, 3)
+                if now - self.acked_sent_at < LINK_STOP_TIMEOUT else 1
             )
-            self.ack_seq, self.ack_at = ack_seq, now
+            self.ack_seq, self.acked_sent_at = ack_seq, sent
 
     def online(self, now: float) -> PeerState | None:
         if (
             self.remote is not None
             and self.consecutive >= 3
             and self.ack_consecutive >= 3
-            and now - self.remote.received_at < PEER_TIMEOUT
-            and now - self.ack_at < PEER_TIMEOUT
+            and now - self.remote.received_at < LINK_STOP_TIMEOUT
+            and now - self.acked_sent_at < LINK_STOP_TIMEOUT
         ):
             return self.remote
         return None
