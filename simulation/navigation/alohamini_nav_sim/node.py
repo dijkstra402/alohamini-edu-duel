@@ -22,10 +22,14 @@ from alohamini.schema import BodyVelocity
 
 from .world import World
 
+STEP_PERIOD = 0.02
+
 
 class Simulator(Node):
-    def __init__(self):
-        super().__init__("alohamini_nav_sim")
+    def __init__(self, *, context=None, shared_world=None):
+        super().__init__(
+            "alohamini_nav_sim", context=context, enable_rosout=shared_world is None
+        )
         self.declare_parameter("world", "")
         self.declare_parameter("robot_model", "alohamini2edu")
         self.declare_parameter("sensor_profile", "")
@@ -34,7 +38,11 @@ class Simulator(Node):
         self.kinematics = OmniBaseKinematics(model.wheel_radius_m, model.base_radius_m)
         self.wheel_positions = [0.0] * 3
         self.profile = sensor_profile(self.model, self.get_parameter("sensor_profile").value)
-        self.world = World(yaml.safe_load(Path(self.get_parameter("world").value).read_text()))
+        self.world = (
+            shared_world
+            if shared_world is not None
+            else World(yaml.safe_load(Path(self.get_parameter("world").value).read_text()))
+        )
         self.clock = self.create_publisher(Clock, "/clock", 10)
         self.scan_pub = self.create_publisher(LaserScan, "/scan", qos_profile_sensor_data)
         self.imu_pub = self.create_publisher(Imu, "/imu/data_raw", qos_profile_sensor_data)
@@ -49,7 +57,8 @@ class Simulator(Node):
         self.last_command = 0.0
         self.steps = 0
         self.session = "simulation-" + uuid.uuid4().hex
-        self.create_timer(0.02, self.tick)
+        if shared_world is None:
+            self.create_timer(STEP_PERIOD, self.tick)
 
     def enable(self, request, response):
         self.enabled = request.data
@@ -66,15 +75,19 @@ class Simulator(Node):
             )
             self.last_command = time.monotonic()
 
-    def tick(self):
-        velocity = (
+    def requested_velocity(self):
+        return (
             self.velocity
             if self.enabled and time.monotonic() - self.last_command < 0.5
             else (0.0, 0.0, 0.0)
         )
-        vx, vy, wz = self.world.step(*velocity, 0.02)
+    def tick(self):
+        self.publish_frame(self.world.step(*self.requested_velocity(), STEP_PERIOD))
+
+    def publish_frame(self, velocity):
+        vx, vy, wz = velocity
         self.steps += 1
-        nanoseconds = 1_000_000_000 + self.steps * 20_000_000
+        nanoseconds = 1_000_000_000 + self.steps * round(STEP_PERIOD * 1_000_000_000)
         clock = Clock()
         clock.clock.sec, clock.clock.nanosec = divmod(nanoseconds, 10**9)
         self.clock.publish(clock)
@@ -89,7 +102,7 @@ class Simulator(Node):
         joints.name = [f"wheel{i}_joint" for i in (1, 2, 3)]
         joints.velocity = list(self.kinematics.body_to_wheels(BodyVelocity(vx, vy, wz)))
         self.wheel_positions = [
-            p + v * 0.02 for p, v in zip(self.wheel_positions, joints.velocity, strict=True)
+            p + v * STEP_PERIOD for p, v in zip(self.wheel_positions, joints.velocity, strict=True)
         ]
         joints.position = self.wheel_positions
         self.joint_pub.publish(joints)

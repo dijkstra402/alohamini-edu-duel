@@ -56,15 +56,16 @@ class World:
         self.yaw = math.atan2(math.sin(self.yaw + wz * dt), math.cos(self.yaw + wz * dt))
         return vx, vy, wz
 
-    def scan(self, xyz, rpy, count=360, maximum=8.0):
+    def scan(self, xyz, rpy, count=360, maximum=8.0, *, dynamic_segments=()):
         x = self.x + xyz[0] * math.cos(self.yaw) - xyz[1] * math.sin(self.yaw)
         y = self.y + xyz[0] * math.sin(self.yaw) + xyz[1] * math.cos(self.yaw)
+        segments = (*self.segments, *dynamic_segments)
         result = []
         for i in range(count):
             angle = self.yaw + rpy[2] - math.pi + i * 2 * math.pi / (count - 1)
             dx, dy = math.cos(angle), math.sin(angle)
             distance = math.inf
-            for (ax, ay), (bx, by) in self.segments:
+            for (ax, ay), (bx, by) in segments:
                 sx, sy = bx - ax, by - ay
                 denominator = dx * sy - dy * sx
                 if abs(denominator) < 1e-9:

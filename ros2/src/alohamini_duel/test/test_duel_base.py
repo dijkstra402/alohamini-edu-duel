@@ -1,0 +1,160 @@
+import json
+import math
+import select
+import socket
+from pathlib import Path
+
+import pytest
+from alohamini.schema import BodyVelocity
+from alohamini_duel.arena import BASE_RADIUS, ROBOT_IDS, Arena
+from alohamini_duel.cmd_vel_arbiter import MAX_SPEED, STOP, VelocityArbiter
+from alohamini_duel.peer_sync import PeerLink, PeerState, open_peer_socket
+
+POSE_A = (1.45, 1.4, 0.0)
+POSE_B = (2.4, 2.45, math.pi)
+
+
+@pytest.fixture
+def arena(tmp_path):
+    config = Path(__file__).parents[1] / "config/arena_example.yaml"
+    map_file = tmp_path / "map.yaml"
+    map_file.write_text("image: map.pgm\nresolution: 0.05\norigin: [0, 0, 0]\n")
+    (tmp_path / "map.pgm").write_bytes(b"P5\n1 1\n255\n\0")
+    return Arena.load(config, map_file)
+
+
+def exchange(a, b, now):
+    sent_a = a.encode(POSE_A, 0.0, 0.0, now)
+    sent_b = b.encode(POSE_B, 0.0, 0.0, now + 100_000)
+    a.accept(sent_b, now)
+    b.accept(sent_a, now)
+    return sent_a
+
+
+def test_geometry_uses_rotated_map_and_sweeps_entire_segment(arena):
+    rotated = Arena((8, -4, math.pi / 2), arena.size, arena.obstacles, {}, arena.fingerprint)
+    assert rotated.local((7.5, -2)) == pytest.approx((2, 0.5))
+    assert rotated.contains((7.5, -2))
+    assert not rotated.contains((8.1, -2))
+    assert not arena.path_clear((0.65, 1.3), (0.9, 2.2), 0.05)
+    assert not arena.path_clear((2.0, 2.0), (1.0, 2.0), BASE_RADIUS)
+    assert arena.path_clear((1.5, 1.2), (1.5, 1.4), BASE_RADIUS)
+
+
+def test_map_fingerprint_includes_grid_and_invalid_start_is_rejected(arena, tmp_path):
+    src = Path(__file__).parents[1] / "config/arena_example.yaml"
+    map_file = tmp_path / "map.yaml"
+    (tmp_path / "map.pgm").write_bytes(b"P5\n1 1\n255\n\xff")
+    assert Arena.load(src, map_file).fingerprint != arena.fingerprint
+    config = tmp_path / "arena.yaml"
+    config.write_text(src.read_text().replace("0.55, 0.55", "0.05, 0.05"))
+    with pytest.raises(ValueError, match="底盘净空"):
+        Arena.load(config, map_file)
+
+
+def test_udp_clock_origin_order_restart_and_old_session(arena):
+    a, b = (PeerLink(robot, arena) for robot in ROBOT_IDS)
+    assert a.online(0) is None
+    for index in range(4):
+        old = exchange(a, b, index * 0.05)
+    assert a.online(0.15).pose == POSE_B
+    assert b.online(0.15).pose == POSE_A
+    b.accept(old, 0.6)
+    assert b.online(0.66) is None
+
+    restarted = PeerLink(a.robot_id, arena)
+    for index in range(3):
+        exchange(restarted, b, 1.0 + index * 0.05)
+    assert b.online(1.1) is None
+    exchange(restarted, b, 1.15)
+    assert b.online(1.15).session_id == restarted.session_id
+    b.accept(old, 2.0)
+    assert b.remote.session_id == restarted.session_id
+    assert b.online(2.0) is None
+
+
+def test_one_way_drop_stops_both_and_requires_recent_acknowledgements(arena):
+    a, b = (PeerLink(robot, arena) for robot in ROBOT_IDS)
+    for index in range(4):
+        exchange(a, b, index * 0.05)
+    for index in range(4, 16):
+        now = index * 0.05
+        a.encode(POSE_A, 0.0, 0.0, now)
+        a.accept(b.encode(POSE_B, 0.0, 0.0, now), now)
+    assert a.remote.received_at == 0.75
+    assert a.online(0.75) is None
+    assert b.online(0.75) is None
+    for index in range(16, 19):
+        exchange(a, b, index * 0.05)
+    assert a.online(0.9) is None
+    exchange(a, b, 0.95)
+    assert a.online(0.95) is not None
+    assert b.online(0.95) is not None
+
+
+def test_receiver_ignores_bad_geometry_and_different_arena(arena):
+    a, b = (PeerLink(robot, arena) for robot in ROBOT_IDS)
+    valid = json.loads(a.encode(POSE_A, 0.0, 0.0, 0))
+    for changes in (
+        {"x": -1.0}, {"x": math.nan}, {"seq": True}, {"arena_id": "其他场地"}, {"session_id": []}
+    ):
+        b.accept(json.dumps(valid | changes).encode(), 0)
+        assert b.remote is None
+    for bad in (b"[]", b"\xff", b"{" * 1025):
+        b.accept(bad, 0)
+        assert b.remote is None
+
+
+def test_udp_socket_receives_only_the_configured_peer(arena):
+    a, b = (PeerLink(robot, arena) for robot in ROBOT_IDS)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as remote:
+        remote.bind(("127.0.0.1", 0))
+        remote.settimeout(1)
+        with open_peer_socket("127.0.0.1", 0, *remote.getsockname()) as local:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as unrelated:
+                unrelated.sendto("其他端点".encode(), local.getsockname())
+            local.send(a.encode(POSE_A, 0.0, 0.0, 2.0))
+            data, endpoint = remote.recvfrom(1024)
+            b.accept(data, 15)
+            assert b.remote.pose == POSE_A
+            remote.sendto(b.encode(POSE_B, 0.0, 0.0, 16), endpoint)
+            assert select.select([local], [], [], 1)[0]
+            a.accept(local.recv(1024), 3)
+            assert a.remote.pose == POSE_B
+
+
+def test_arbitration_priority_timeout_and_stop_recovery(arena):
+    arbiter = VelocityArbiter(arena)
+    peer = PeerState("会话", 1, POSE_B, 0)
+    nav = BodyVelocity(0.06, 0.0, 0.0)
+    duel = BodyVelocity(0.0, -0.05, 0.0)
+    arbiter.submit("nav", nav, 0)
+    assert arbiter.select(POSE_A, peer, 0) == STOP
+    arbiter.enable(True)
+    arbiter.submit("nav", nav, 0)
+    assert arbiter.select(POSE_A, peer, 0) == nav
+    arbiter.submit("duel", duel, 0.01)
+    assert arbiter.select(POSE_A, peer, 0.02) == duel
+    arbiter.submit("nav", nav, 0.1)
+    assert arbiter.select(POSE_A, peer, 0.17) == nav
+    assert arbiter.select(POSE_A, None, 0.18) == STOP
+    assert arbiter.select(POSE_A, peer, 0.19) == STOP
+    arbiter.submit("duel", duel, 0.2)
+    assert arbiter.select(None, peer, 0.21) == STOP
+    assert arbiter.select(POSE_A, peer, 0.22) == STOP
+    arbiter.submit("duel", duel, 0.24)
+    assert arbiter.select(POSE_A, peer, 0.40) == STOP
+
+
+def test_geometry_stops_at_wall_and_when_lateral_motion_closes_gap(arena):
+    arbiter = VelocityArbiter(arena)
+    arbiter.enable(True)
+    arbiter.submit("duel", BodyVelocity(-0.1, 0, 0), 0)
+    peer = PeerState("会话", 1, POSE_B, 0)
+    assert arbiter.select((0.47, 0.62, 0.0), peer, 0.0) == STOP
+    arbiter.submit("duel", BodyVelocity(0.0, 0.1, 0), 0)
+    close_peer = PeerState("会话", 1, (1.45, 2.36, 0), 0)
+    assert arbiter.select(POSE_A, close_peer, 0.0) == STOP
+    arbiter.submit("duel", BodyVelocity(0.3, 0.3, 0), 0)
+    command = arbiter.select(POSE_A, peer, 0.0)
+    assert math.hypot(command.x_m_s, command.y_m_s) == pytest.approx(MAX_SPEED)
