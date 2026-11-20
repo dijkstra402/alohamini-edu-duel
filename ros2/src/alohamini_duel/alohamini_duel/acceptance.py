@@ -1,7 +1,9 @@
 """一键运行双域仿真并保存可复查的验收报告。"""
 
 import argparse
+import fcntl
 import json
+import math
 import os
 import signal
 import socket
@@ -14,6 +16,8 @@ from pathlib import Path
 import yaml
 
 from .calibrate import calibrate
+from .route import load_route
+from .status import wheel_is_stationary
 
 
 def require(condition, message):
@@ -33,6 +37,7 @@ def stop_process(process):
 
 
 def run_acceptance(output, domains, use_nav2, results):
+    from alohamini_navigation.launching import model_config
     from ament_index_python.packages import (
         PackageNotFoundError,
         get_package_prefix,
@@ -62,7 +67,7 @@ def run_acceptance(output, domains, use_nav2, results):
         measurements = yaml.safe_load((config / "measurements_example.yaml").read_bytes())
         measurements["start_poses"]["shield_b"][:2] = [1.80, 1.80]
         arena_file = output / "acceptance_arena.yaml"
-        calibrate(measurements, map_file, arena_file, 0.03)
+        arena = calibrate(measurements, map_file, arena_file, 0.03)
         expected_scores["shield_b"] = 1
     os.environ["ROS_LOCALHOST_ONLY"] = "1"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
@@ -76,17 +81,31 @@ def run_acceptance(output, domains, use_nav2, results):
 
     def run(argv, timeout, *, domain=None, expected=0):
         env = os.environ if domain is None else os.environ | {"ROS_DOMAIN_ID": str(domain)}
-        result = subprocess.run(
-            argv, env=env, capture_output=True, text=True, timeout=timeout, check=False
-        )
-        require(result.returncode == expected, f"{argv[3]} 退出异常\n{result.stdout}{result.stderr}")
-        return result.stdout
+        with subprocess.Popen(
+            argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                raise
+            require(process.returncode == expected, f"{argv[3]} 退出异常\n{stdout}{stderr}")
+        return stdout
 
     with ExitStack() as resources:
+        for domain in domains:
+            lock = Path(tempfile.gettempdir()) / f"alohamini-duel-acceptance-{domain}.lock"
+            handle = resources.enter_context(lock.open("a"))
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError(f"ROS 域 {domain} 已有双车验收在运行") from error
         endpoints = [
             attach_domain(
                 resources, domain,
-                lambda ctx, domain=domain: Node(f"duel_acceptance_{domain}", context=ctx),
+                lambda ctx: Node(f"duel_acceptance_{os.getpid()}", context=ctx),
             )
             for domain in domains
         ]
@@ -120,7 +139,7 @@ def run_acceptance(output, domains, use_nav2, results):
             time.sleep(0.04)
         for node, domain in zip(nodes, domains, strict=True):
             require(
-                set(node.get_node_names()) == {node.get_name()},
+                node.get_node_names() == [node.get_name()],
                 f"ROS 域 {domain} 已有其他节点，需选用空闲域",
             )
 
@@ -188,11 +207,11 @@ def run_acceptance(output, domains, use_nav2, results):
         def scoreboard(domain):
             return read_json(domain, "/duel/scoreboard")
 
-        def truth():
-            return telemetry[(domains[0], "/simulation/ground_truth")]
+        def truth(domain):
+            return telemetry[(domain, "/simulation/ground_truth")]
 
-        def speed():
-            return truth().twist.twist.linear.x
+        def stationary():
+            return all(wheel_is_stationary(truth(domain).twist.twist) for domain in domains)
 
         def switch(topic, enabled):
             client = nodes[0].create_client(SetBool, topic)
@@ -206,11 +225,12 @@ def run_acceptance(output, domains, use_nav2, results):
 
         wait_for(
             lambda: both_online() and all(scoreboard(domain).get("ready") for domain in domains)
-            and (domains[0], "/simulation/ground_truth") in telemetry,
+            and all((domain, "/simulation/ground_truth") in telemetry for domain in domains),
             40, "双车定位或心跳未就绪",
         )
         results["双车上线"] = True
         resources.callback(deactivate_navigation)
+
         def radar_ready(domain):
             cloud = telemetry.get((domain, cloud_topic))
             summary = read_json(domain, radar_topic)
@@ -247,13 +267,23 @@ def run_acceptance(output, domains, use_nav2, results):
         switch("/alohamini_duel_base/command_enable", True)
         route = command("duel_route", "--robot-id", "sword_a", "--timeout", "35")
         if use_nav2:
-            run([*route, "--route", str(config / "route_example.yaml")], 40, domain=domains[0])
+            route_file = config / "route_example.yaml"
+            x, y, _ = load_route(route_file, arena)[-1]
+            params = yaml.safe_load(Path(model_config("alohamini2edu", "nav2")).read_bytes())
+            goal_checker = params["controller_server"]["ros__parameters"]["general_goal_checker"]
+
+            def goal_distance():
+                position = truth(domains[0]).pose.pose.position
+                return math.hypot(position.x - x, position.y - y)
+
+            run([*route, "--route", str(route_file)], 40, domain=domains[0])
             wait_for(
-                lambda: truth().pose.pose.position.x > 0.96 and abs(speed()) < 0.01,
+                lambda: goal_distance() <= goal_checker["xy_goal_tolerance"] and stationary(),
                 3, "仿真车未驶入目标航点邻域并停稳",
             )
-            position = truth().pose.pose.position
+            position = truth(domains[0]).pose.pose.position
             results["固定航点终点"] = [position.x, position.y]
+            results["固定航点平面误差_m"] = goal_distance()
 
         velocity = nodes[0].create_publisher(Twist, "/cmd_vel_duel", 1)
         move = Twist()
@@ -292,7 +322,7 @@ def run_acceptance(output, domains, use_nav2, results):
                 5, "第二条路线未启动",
             )
         def moving():
-            return speed() > (0.025 if use_nav2 else 0.05)
+            return truth(domains[0]).twist.twist.linear.x > (0.025 if use_nav2 else 0.05)
 
         wait_for(moving, 8, "故障注入前未观察到仿真车运动", drive if not use_nav2 else None)
         if not use_nav2:
@@ -305,13 +335,13 @@ def run_acceptance(output, domains, use_nav2, results):
         wait_for(
             lambda: all(not telemetry[(domain, "/duel/peer_online")].data for domain in domains)
             and all(not scoreboard(domain).get("ready") for domain in domains)
-            and abs(speed()) < 0.01,
+            and stationary(),
             4, "断联后底盘或裁判未停", drive,
         )
         stopped_at = time.monotonic()
 
         def sustained_stop():
-            require(abs(speed()) < 0.01, "停稳后观察到异常速度")
+            require(stationary(), "停稳后观察到异常速度")
             return time.monotonic() - stopped_at >= 0.25
 
         wait_for(sustained_stop, 2, "持续速度输入下未保持停车", drive)

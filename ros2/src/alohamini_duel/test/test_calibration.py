@@ -74,3 +74,31 @@ def test_calibrate_checks_corner_order_and_measurement_tolerance(measurements, t
         calibrate(measurements, MAP, output, 0.03)
     assert not output.exists()
     calibrate(measurements, MAP, output, 0.08)
+
+
+def test_calibrate_rejects_start_outside_measured_wall_clearance(measurements, tmp_path):
+    output = tmp_path / "arena.yaml"
+    measurements["wall_corners"][3][0] = 0.05
+    measurements["start_poses"]["sword_a"] = [0.477, 2.50, 0]
+    with pytest.raises(ValueError, match="净空"):
+        calibrate(measurements, MAP, output, 0.03)
+    assert not output.exists()
+    measurements["start_poses"]["sword_a"][0] = 0.55
+    assert calibrate(measurements, MAP, output, 0.03).origin[0] == pytest.approx(0.05)
+
+
+def test_calibrate_rejects_repeated_corners(measurements, tmp_path):
+    output = tmp_path / "arena.yaml"
+    measurements["obstacle_corners"] = [[[1, 1], [1, 1], [1.03, 1.05], [1, 1.05]]]
+    with pytest.raises(ValueError, match="重合角点"):
+        calibrate(measurements, MAP, output, 0.03)
+    assert not output.exists()
+
+
+def test_calibrate_rejects_map_without_grid_metadata(measurements, tmp_path):
+    output = tmp_path / "arena.yaml"
+    incomplete_map = tmp_path / "map.yaml"
+    incomplete_map.write_text(yaml.safe_dump({"image": str(MAP.with_suffix(".pgm"))}))
+    with pytest.raises(ValueError, match="地图栅格参数"):
+        calibrate(measurements, incomplete_map, output, 0.03)
+    assert not output.exists()

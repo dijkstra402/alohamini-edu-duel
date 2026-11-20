@@ -17,22 +17,33 @@ def fit_rectangle(points, tolerance, name):
     if not isinstance(points, list) or len(points) != 4:
         raise ValueError(f"{name}需要按逆时针填写四个角点")
     corners = tuple(coordinates(point, 2, name) for point in points)
+    edges = tuple(
+        (b[0] - a[0], b[1] - a[1])
+        for a, b in zip(corners, corners[1:] + corners[:1], strict=True)
+    )
+    if any(
+        a[0] * b[1] - a[1] * b[0] <= 0
+        for a, b in zip(edges, edges[1:] + edges[:1], strict=True)
+    ):
+        raise ValueError(f"{name}的角点顺序有误或存在重合角点")
     first, second, *_ = corners
     yaw = math.atan2(second[1] - first[1], second[0] - first[0])
     provisional = (*first, yaw)
-    lower_left, lower_right, upper_right, upper_left = [
-        local_point(provisional, point) for point in corners
-    ]
+    projected = tuple(local_point(provisional, point) for point in corners)
+    lower_left, lower_right, upper_right, upper_left = projected
     left = (lower_left[0] + upper_left[0]) / 2
     right = (lower_right[0] + upper_right[0]) / 2
     bottom = (lower_left[1] + lower_right[1]) / 2
     top = (upper_left[1] + upper_right[1]) / 2
     expected = ((left, bottom), (right, bottom), (right, top), (left, top))
     if right <= left or top <= bottom or any(
-        math.dist(local_point(provisional, point), target) > tolerance
-        for point, target in zip(corners, expected, strict=True)
+        math.dist(point, target) > tolerance
+        for point, target in zip(projected, expected, strict=True)
     ):
         raise ValueError(f"{name}的角点顺序或矩形误差不符合要求")
+    # 墙边按测点取内侧包络，拟合误差不能扩大可通行区域。
+    left, right = max(lower_left[0], upper_left[0]), min(lower_right[0], upper_right[0])
+    bottom, top = max(lower_left[1], lower_right[1]), min(upper_left[1], upper_right[1])
     c, s = math.cos(yaw), math.sin(yaw)
     origin = (first[0] + left * c - bottom * s, first[1] + left * s + bottom * c, yaw)
     return origin, (right - left, top - bottom), corners
@@ -61,6 +72,17 @@ def calibrate(measurements, map_file, output, tolerance):
         "starts": starts,
     }
     validate_map_revision(map_file, "alohamini2edu")
+    map_data = yaml.safe_load(Path(map_file).read_bytes())
+    if not isinstance(map_data, dict):
+        raise ValueError("地图 YAML 必须包含栅格参数")
+    resolution, occupied, free, negate = coordinates(
+        [map_data.get(key) for key in ("resolution", "occupied_thresh", "free_thresh", "negate")],
+        4,
+        "地图栅格参数",
+    )
+    coordinates(map_data.get("origin"), 3, "地图原点")
+    if resolution <= 0 or not 0 <= free < occupied <= 1 or negate not in (0, 1):
+        raise ValueError("地图分辨率、阈值或灰度反转参数无效")
     output = Path(output)
     with TemporaryDirectory(dir=output.parent) as directory:
         staging = Path(directory) / "arena.yaml"
