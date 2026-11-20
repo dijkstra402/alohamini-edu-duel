@@ -22,6 +22,11 @@ def yaw_from_quaternion(q):
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
 
 
+def angle_error(angle, yaw):
+    difference = angle - yaw
+    return abs(math.atan2(math.sin(difference), math.cos(difference)))
+
+
 @dataclass(frozen=True)
 class VehicleStatus:
     session_id: str

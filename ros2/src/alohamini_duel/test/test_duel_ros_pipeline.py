@@ -50,6 +50,14 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     assert report["ROS域"] == [73, 74]
     checks = report["检查"]
     assert checks["只读预检与速度冲突检测"]
+    preflight = checks["起点预检"]
+    assert preflight["通过"] and len(preflight["场地指纹"]) == 64
+    assert preflight["起点偏差限值"] == {"位置_m": 0.20, "朝向_deg": 20}
+    for vehicle in preflight["双车"].values():
+        assert vehicle["检查"]["起点位置偏差在限值内"]
+        assert vehicle["检查"]["起点朝向偏差在限值内"]
+        assert vehicle["距标定起点_m"] <= 0.20
+        assert vehicle["起点朝向偏差_deg"] <= 20
     assert checks["断联停稳"]["记录完整"]
     marked = checks["断联停稳"]
     assert marked["通过"] and marked["0.5秒内停稳"]

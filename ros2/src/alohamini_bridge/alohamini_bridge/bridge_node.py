@@ -304,6 +304,7 @@ class AlohaMiniBridge(Node):
         self.raw_pub = self.create_publisher(String, "~/state_json", 10)
         self.diagnostics_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
         self.cmd_vel_topic = parameter("cmd_vel_topic")
+        self.resolved_cmd_vel_topic = self.resolve_topic_name(self.cmd_vel_topic)
         self.cmd_subscription = None
         self.create_service(SetBool, "~/command_enable", self.on_command_enable)
         self.actions = None if self.base_only else ControllerActions(self)
@@ -650,6 +651,7 @@ class AlohaMiniBridge(Node):
             KeyValue(key="observation_count", value=str(self.observation_count)),
             KeyValue(key="invalid_observations", value=str(self.invalid_observations)),
             KeyValue(key="host_robot_model", value=self._host_model),
+            KeyValue(key="resolved_cmd_vel_topic", value=self.resolved_cmd_vel_topic),
             KeyValue(key="host_joint_holds", value=",".join(self._host_joint_holds)),
             KeyValue(
                 key="lift_command_ready",

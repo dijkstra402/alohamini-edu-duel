@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .arena import ROBOT_IDS, Arena, Pose
 from .peer_sync import PEER_TIMEOUT
-from .status import VehicleStatus
+from .status import VehicleStatus, angle_error
 
 FIRST, SECOND = ROBOT_IDS
 MATCHING_CHOICE = {"left": "right", "center": "center", "right": "left"}
@@ -21,11 +21,6 @@ class PlayerReport:
     pose: Pose | None
     received_at: float
     consecutive: int
-
-
-def angle_error(angle, yaw):
-    difference = angle - yaw
-    return abs(math.atan2(math.sin(difference), math.cos(difference)))
 
 
 class Referee:

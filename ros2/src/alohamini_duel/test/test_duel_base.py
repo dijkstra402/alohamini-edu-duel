@@ -3,6 +3,7 @@ import math
 import select
 import socket
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,99 @@ def test_vehicle_status_distinguishes_motion_permission_and_validates_identity(a
         {"online": True, "pose": None},
     ):
         assert VehicleStatus.decode(json.dumps(frame | invalid), ROBOT_IDS[0], arena) is None
+
+
+def test_preflight_start_limits_require_recent_samples_in_the_same_session(arena):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from rclpy.context import Context
+    from std_msgs.msg import String
+
+    from alohamini_duel.preflight import HEADING_CHECK, POSITION_CHECK, VehicleCheck
+
+    robot = ROBOT_IDS[0]
+    arena = replace(
+        arena, starts=arena.starts | {robot: (*POSE_A[:2], math.radians(179))}
+    )
+    frame = {
+        "robot_id": robot, "arena_id": arena.fingerprint, "session_id": "会话一",
+        "pose": [POSE_A[0] + 0.05, POSE_A[1], math.radians(-179)],
+        "online": True, "motion_enabled": False,
+    }
+    with ExitStack() as resources:
+        context = Context()
+        context.init(args=[], domain_id=92)
+        resources.callback(context.try_shutdown)
+        node = VehicleCheck(
+            context, arena, robot, True, position_limit=0.10, heading_limit=3.0
+        )
+        resources.callback(node.destroy_node)
+        for sequence in (1, 2, 3):
+            node.on_status(String(data=json.dumps(frame | {"seq": sequence})))
+        passed = node.results(None, None)
+        assert passed["检查"][POSITION_CHECK]
+        assert passed["检查"][HEADING_CHECK]
+        assert passed["距标定起点_m"] == pytest.approx(0.05)
+        assert passed["起点朝向偏差_deg"] == pytest.approx(2.0)
+
+        displaced = frame | {"seq": 4, "pose": [POSE_A[0] + 0.15, *frame["pose"][1:]]}
+        node.on_status(String(data=json.dumps(displaced)))
+        displaced_checks = node.results(None, None)["检查"]
+        assert not displaced_checks[POSITION_CHECK]
+        assert displaced_checks[HEADING_CHECK]
+
+        rotated = frame | {"seq": 5, "pose": [*frame["pose"][:2], math.radians(-170)]}
+        node.on_status(String(data=json.dumps(rotated)))
+        assert not node.results(None, None)["检查"][HEADING_CHECK]
+        for sequence in (6, 7, 8):
+            node.on_status(String(data=json.dumps(frame | {"seq": sequence})))
+        assert node.results(None, None)["检查"][POSITION_CHECK]
+        restarted = frame | {"seq": 1, "session_id": "会话二"}
+        node.on_status(String(data=json.dumps(restarted)))
+        assert not node.results(None, None)["检查"][POSITION_CHECK]
+        wrong_map = restarted | {"seq": 2, "arena_id": "不同场地"}
+        node.on_status(String(data=json.dumps(wrong_map)))
+        assert not node.results(None, None)["检查"]["定位和地图一致"]
+        assert node.results(None, None)["距标定起点_m"] is None
+
+
+def test_preflight_rejects_bridge_topic_remapped_away_from_monitor(arena):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+    from rclpy.context import Context
+    from rclpy.node import Node
+
+    from alohamini_duel.preflight import BRIDGE_TOPIC_CHECK, VehicleCheck
+
+    with ExitStack() as resources:
+        context = Context()
+        context.init(args=[], domain_id=92)
+        resources.callback(context.try_shutdown)
+        node = VehicleCheck(context, arena, ROBOT_IDS[0], False)
+        resources.callback(node.destroy_node)
+        bridge = Node(
+            "preflight_bridge_test", context=context,
+            cli_args=["--ros-args", "-r", "/cmd_vel_safe:=/different_topic"],
+        )
+        resources.callback(bridge.destroy_node)
+        status = DiagnosticStatus(
+            name="AlohaMini Host state bridge",
+            level=DiagnosticStatus.OK,
+            values=[
+                KeyValue(key="host_robot_model", value="alohamini2edu"),
+                KeyValue(key="command_enabled", value="false"),
+                KeyValue(key="stop_pending", value="false"),
+                KeyValue(key="resolved_cmd_vel_topic", value="/cmd_vel_safe"),
+            ],
+        )
+        message = DiagnosticArray(status=[status])
+        node.on_diagnostics(message)
+        node.on_diagnostics(message)
+        assert node.results(None, None)["检查"][BRIDGE_TOPIC_CHECK]
+        status.values[-1].value = bridge.resolve_topic_name("/cmd_vel_safe")
+        node.on_diagnostics(message)
+        report = node.results(None, None)
+        assert report["桥接解析后速度入口"] == "/different_topic"
+        assert not report["检查"][BRIDGE_TOPIC_CHECK]
 
 
 def test_fixed_route_loads_map_poses_and_rejects_outside_footprints(arena, tmp_path):

@@ -301,8 +301,12 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         )
         results["雷达差分"] = {str(domain): read_json(domain, radar_topic) for domain in domains}
 
-        preflight = command("duel_check", *domain_args, "--duration", "2")
-        require(json.loads(run(preflight, 8))["通过"], "正常状态预检未通过")
+        preflight = command(
+            "duel_check", *domain_args, "--duration", "2",
+            "--start-position-tolerance-m", "0.20", "--start-heading-tolerance-deg", "20",
+        )
+        results["起点预检"] = json.loads(run(preflight, 8))
+        require(results["起点预检"]["通过"], "正常状态预检未通过")
         extra = nodes[0].create_publisher(Twist, "/cmd_vel", 1)
         # Humble 的 ros2 run 会在失败码之后为标准输出追加退出说明。
         conflict, _ = json.JSONDecoder().raw_decode(run(preflight, 8, expected=1))

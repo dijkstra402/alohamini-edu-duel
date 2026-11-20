@@ -18,24 +18,32 @@ from std_msgs.msg import String
 
 from .arena import BASE_RADIUS, ROBOT_IDS, Arena
 from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
-from .status import VehicleStatus, fresh_stamp, wheel_is_stationary
+from .status import VehicleStatus, angle_error, fresh_stamp, wheel_is_stationary
 
 BRIDGE = "alohamini_lerobot_bridge"
 ARBITER = "alohamini_duel_base"
 MONITOR = "collision_monitor"
 SIMULATOR = "alohamini_nav_sim"
+POSITION_CHECK = "起点位置偏差在限值内"
+HEADING_CHECK = "起点朝向偏差在限值内"
+BRIDGE_TOPIC_CHECK = "真机桥接解析后的速度入口正确"
+STATUS_CHECKS = ("定位和地图一致", "双向心跳", "仲裁未使能", POSITION_CHECK, HEADING_CHECK)
 
 
 class VehicleCheck(Node):
-    def __init__(self, context, arena, robot_id, simulation):
+    def __init__(
+        self, context, arena, robot_id, simulation, *, position_limit=None, heading_limit=None
+    ):
         super().__init__(
             f"duel_check_{robot_id}",
             context=context,
             parameter_overrides=[Parameter("use_sim_time", value=simulation)],
         )
         self.arena, self.robot_id = arena, robot_id
+        self.position_limit, self.heading_limit = position_limit, heading_limit
         self.samples: dict[str, tuple[int, float]] = {}
         self.status: VehicleStatus | None = None
+        self.resolved_bridge_topic: str | None = None
         self.safe_velocity_samples = 0
         self.nonzero_safe_velocity = False
         for kind, topic, callback in (
@@ -69,13 +77,18 @@ class VehicleCheck(Node):
     def current_stamp(self, header, frame, max_age=0.5):
         return fresh_stamp(header, frame, self.get_clock().now().nanoseconds, max_age) is not None
 
+    def start_errors(self, pose):
+        if pose is None:
+            return None, None
+        start = self.arena.starts[self.robot_id]
+        return math.dist(pose[:2], start[:2]), math.degrees(angle_error(pose[2], start[2]))
+
     def on_status(self, message):
         status = VehicleStatus.decode(message.data, self.robot_id, self.arena)
         if status is None:
             self.status = None
-            self.record("定位和地图一致", False)
-            self.record("双向心跳", False)
-            self.record("仲裁未使能", False)
+            for name in STATUS_CHECKS:
+                self.samples.pop(name, None)
             return
         if (
             self.status is not None
@@ -83,10 +96,23 @@ class VehicleCheck(Node):
             and status.seq <= self.status.seq
         ):
             return
+        if self.status is not None and status.session_id != self.status.session_id:
+            for name in STATUS_CHECKS:
+                self.samples.pop(name, None)
         self.status = status
         self.record("定位和地图一致", status.pose is not None)
         self.record("双向心跳", status.online)
         self.record("仲裁未使能", status.motion_enabled is False)
+        if self.position_limit is not None or self.heading_limit is not None:
+            position_error, heading_error = self.start_errors(status.pose)
+            if self.position_limit is not None:
+                self.record(
+                    POSITION_CHECK, position_error is not None and position_error <= self.position_limit
+                )
+            if self.heading_limit is not None:
+                self.record(
+                    HEADING_CHECK, heading_error is not None and heading_error <= self.heading_limit
+                )
 
     def on_scan(self, message):
         valid = sum(
@@ -114,6 +140,10 @@ class VehicleCheck(Node):
             if status.name != "AlohaMini Host state bridge":
                 continue
             values = {item.key: item.value for item in status.values}
+            resolved = values.get("resolved_cmd_vel_topic")
+            if resolved is not None:
+                self.resolved_bridge_topic = resolved
+            self.record(BRIDGE_TOPIC_CHECK, resolved == "/cmd_vel_safe", max_gap=1.5)
             ok = (
                 status.level == DiagnosticStatus.OK
                 and values.get("host_robot_model") == "alohamini2edu"
@@ -151,6 +181,9 @@ class VehicleCheck(Node):
         cmd_consumers = [
             item.node_name for item in self.get_subscriptions_info_by_topic("/cmd_vel")
         ]
+        safe_consumers = [
+            item.node_name for item in self.get_subscriptions_info_by_topic("/cmd_vel_safe")
+        ]
         active = lifecycle is not None and lifecycle.current_state.id == State.PRIMARY_STATE_ACTIVE
         checks["碰撞监测处于活动状态"] = active
         checks["监测出口未出现非零指令"] = not self.nonzero_safe_velocity
@@ -171,21 +204,25 @@ class VehicleCheck(Node):
                 and parameters.values[0].bool_value is True
                 and parameters.values[1].string_value == "/cmd_vel_safe"
             )
+            if self.resolved_bridge_topic is not None:
+                checks[BRIDGE_TOPIC_CHECK] = self.recent(BRIDGE_TOPIC_CHECK, count=2, max_age=1.5)
         if self.bridge_params is None:
-            sinks = self.get_subscriptions_info_by_topic("/cmd_vel_safe")
-            checks["仿真底盘订阅监测出口"] = any(
-                item.node_name == SIMULATOR for item in sinks
-            )
+            checks["仿真底盘订阅监测出口"] = SIMULATOR in safe_consumers
         pose = self.status.pose if checks["定位和地图一致"] else None
         checks["本车名义净空"] = pose is not None and self.arena.path_clear(
             pose[:2], pose[:2], BASE_RADIUS
         )
+        position_error, heading_error = self.start_errors(pose)
+        if self.position_limit is not None:
+            checks[POSITION_CHECK] = self.recent(POSITION_CHECK)
+        if self.heading_limit is not None:
+            checks[HEADING_CHECK] = self.recent(HEADING_CHECK)
         return {
             "检查": checks,
             "位姿": pose,
-            "距标定起点_m": (
-                math.dist(pose[:2], self.arena.starts[self.robot_id][:2]) if pose else None
-            ),
+            "距标定起点_m": position_error,
+            "起点朝向偏差_deg": heading_error,
+            "桥接解析后速度入口": self.resolved_bridge_topic,
             "速度源": cmd_publishers,
             "安全速度源": safe_publishers,
             "安全速度采样数": self.safe_velocity_samples,
@@ -196,9 +233,17 @@ def main(args=None):
     parser = dual_domain_parser(__doc__, (5, 6))
     parser.add_argument("--duration", type=float, default=5.0, help="采样秒数")
     parser.add_argument("--simulation", action="store_true", help="读取仿真时钟")
+    parser.add_argument("--start-position-tolerance-m", type=float, help="起点位置偏差限值（米）")
+    parser.add_argument("--start-heading-tolerance-deg", type=float, help="起点朝向偏差限值（度）")
     arguments = parse_dual_domain_args(parser, args)
     if not math.isfinite(arguments.duration) or arguments.duration <= 0:
         parser.error("采样时间必须是有限正数")
+    position_limit = arguments.start_position_tolerance_m
+    heading_limit = arguments.start_heading_tolerance_deg
+    if position_limit is not None and (not math.isfinite(position_limit) or position_limit < 0):
+        parser.error("起点位置限值必须是有限的非负数")
+    if heading_limit is not None and not 0 <= heading_limit <= 180:
+        parser.error("起点朝向限值必须在 0 到 180 度之间")
     arena = Arena.load(arguments.arena, arguments.map)
     with ExitStack() as resources:
         endpoints = [
@@ -206,7 +251,8 @@ def main(args=None):
                 resources,
                 domain,
                 lambda context, robot=robot: VehicleCheck(
-                    context, arena, robot, arguments.simulation
+                    context, arena, robot, arguments.simulation,
+                    position_limit=position_limit, heading_limit=heading_limit,
                 ),
             )
             for robot, domain in zip(ROBOT_IDS, arguments.domains, strict=True)
@@ -238,7 +284,12 @@ def main(args=None):
     passed = clear and all(all(value["检查"].values()) for value in results.values())
     print(
         json.dumps(
-            {"通过": passed, "名义双车净空": clear, "中心距_m": separation, "双车": results},
+            {
+                "通过": passed, "场地指纹": arena.fingerprint, "名义双车净空": clear,
+                "中心距_m": separation,
+                "起点偏差限值": {"位置_m": position_limit, "朝向_deg": heading_limit},
+                "双车": results,
+            },
             ensure_ascii=False,
             indent=2,
         )
