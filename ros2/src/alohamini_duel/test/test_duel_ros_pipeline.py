@@ -41,7 +41,7 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     command = ["ros2", "run", "alohamini_duel", "duel_accept_sim", "--output", str(output)]
     if not use_nav2:
         command.append("--no-nav2")
-    process = subprocess.run(command, capture_output=True, text=True, timeout=160, check=False)
+    process = subprocess.run(command, capture_output=True, text=True, timeout=210, check=False)
     assert (output / "report.json").is_file(), process.stdout + process.stderr
     report = json.loads((output / "report.json").read_text(encoding="utf-8"))
     assert process.returncode == 0, (report, process.stderr)
@@ -51,6 +51,10 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     checks = report["检查"]
     assert checks["只读预检与速度冲突检测"]
     assert checks["断联停稳"]["记录完整"]
+    timed = checks["故障注入到停稳"]
+    assert set(timed["双车停稳_s"]) == {"sword_a", "shield_b"}
+    assert timed["最迟停稳_s"] == max(timed["双车停稳_s"].values())
+    assert timed["0.5秒内停稳"] == (timed["最迟停稳_s"] <= 0.5)
     assert checks["断联时雷达仍更新"]
     assert checks["重连"]
     assert checks["有序停机"]
@@ -60,7 +64,52 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     assert ("固定航点终点" in checks) == use_nav2
     if use_nav2:
         assert 0 <= checks["固定航点平面误差_m"] <= 0.15
+    if not use_nav2:
+        faults = checks["扩展网络故障"]
+        loss = faults["每三包丢一包"]
+        assert loss["丢弃"] == loss["收到"] // 3 >= 10
+        assert loss["收到"] == loss["丢弃"] + loss["转发"]
+        delay = faults["单向延迟"]
+        assert delay["延迟_s"] == 0.75
+        assert delay["延迟转发"] >= 3
+        assert all(0 < value < 4 for value in delay["双车停稳_s"].values())
+        restart = faults["对端底盘进程重启"]
+        assert restart["新进程"] != restart["旧进程"]
+        assert restart["新会话"] != restart["旧会话"]
+        assert restart["重启后运动默认禁用"]
     assert (output / "stop_watch.log").is_file()
+
+
+def test_both_prescribed_routes_and_same_round(tmp_path, duel_package_lookup):
+    from ament_index_python.packages import PackageNotFoundError
+
+    try:
+        duel_package_lookup("nav2_bt_navigator")
+    except PackageNotFoundError:
+        pytest.skip("需要已加载的 Nav2 导航包")
+    output = tmp_path / "report"
+    command = [
+        "ros2", "run", "alohamini_duel", "duel_accept_sim", "--round", "--output", str(output),
+    ]
+    process = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+    assert (output / "report.json").is_file(), process.stdout + process.stderr
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert process.returncode == 0, (report, process.stderr)
+    assert report["通过"] and report["双车绕箱场景"]
+    checks = report["检查"]
+    trace = checks["双车绕箱"]
+    assert trace["墙和箱体净空通过"]
+    assert trace["最小中心距_m"] > 0.9
+    assert 0 < trace["最大采样间隔_s"] <= 0.20
+    assert all(len(path) == 2 for path in trace["航点"].values())
+    assert all(
+        0 <= visit["平面误差_m"] <= 0.15
+        for path in trace["航点"].values() for visit in path
+    )
+    assert checks["电子判分"]["round"] == trace["回合"] + 1
+    assert checks["电子判分"]["scores"] == {"sword_a": 0, "shield_b": 0}
+    assert checks["电子判分"]["result"] == "双方未进入判分条件"
+    assert checks["有序停机"]
 
 
 def test_acceptance_rejects_simultaneous_runs_with_one_shared_domain(

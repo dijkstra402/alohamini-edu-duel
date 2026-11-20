@@ -75,25 +75,31 @@ def _nodes(context, *, simulation):
             name="lifecycle_manager_localization",
             parameters=[sim_time, {"autostart": True, "node_names": ["map_server", "amcl"]}],
         ),
-        Node(
-            package="alohamini_duel",
-            executable="duel_base",
-            name="alohamini_duel_base",
-            parameters=[
-                sim_time,
-                {
-                    "simulation_controls": simulation,
-                    "referee_status": value("referee_status").lower() == "true",
-                    "robot_id": robot_id,
-                    "arena": str(arena_path),
-                    "map": str(map_path),
-                    "bind_ip": value("bind_ip"),
-                    "bind_port": int(value("bind_port")),
-                    "peer_ip": value("peer_ip"),
-                    "peer_port": int(value("peer_port")),
-                }
-            ],
-            output="screen",
+        *(
+            [
+                Node(
+                    package="alohamini_duel",
+                    executable="duel_base",
+                    name="alohamini_duel_base",
+                    parameters=[
+                        sim_time,
+                        {
+                            "simulation_controls": simulation,
+                            "referee_status": value("referee_status").lower() == "true",
+                            "robot_id": robot_id,
+                            "arena": str(arena_path),
+                            "map": str(map_path),
+                            "bind_ip": value("bind_ip"),
+                            "bind_port": int(value("bind_port")),
+                            "peer_ip": value("peer_ip"),
+                            "peer_port": int(value("peer_port")),
+                        }
+                    ],
+                    output="screen",
+                )
+            ]
+            if not simulation or value("start_base").lower() == "true"
+            else []
         ),
         *(
             navigation_nodes(
@@ -139,6 +145,7 @@ def vehicle_launch(*, simulation):
             DeclareLaunchArgument("use_nav2", default_value="false"),
             DeclareLaunchArgument("radar_diagnostics", default_value="false"),
             DeclareLaunchArgument("use_rviz", default_value="false"),
+            *([DeclareLaunchArgument("start_base", default_value="true")] if simulation else []),
             OpaqueFunction(function=_nodes, kwargs={"simulation": simulation}),
         ]
     )

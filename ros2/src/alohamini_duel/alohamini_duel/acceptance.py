@@ -6,7 +6,6 @@ import json
 import math
 import os
 import signal
-import socket
 import subprocess
 import tempfile
 import time
@@ -15,9 +14,13 @@ from pathlib import Path
 
 import yaml
 
+from .arena import ROBOT_IDS
 from .calibrate import calibrate
 from .route import load_route
-from .status import wheel_is_stationary
+from .sim_evidence import GroundStop, RoundTrace
+from .sim_link import DELAY_S, SimulationLink
+from .sim_round import prepare_round
+from .status import wheel_is_stationary, yaw_from_quaternion
 
 
 def require(condition, message):
@@ -36,7 +39,7 @@ def stop_process(process):
         process.wait(timeout=5)
 
 
-def run_acceptance(output, domains, use_nav2, results):
+def run_acceptance(output, domains, use_nav2, full_round, results):
     from alohamini_navigation.launching import model_config
     from ament_index_python.packages import (
         PackageNotFoundError,
@@ -63,7 +66,12 @@ def run_acceptance(output, domains, use_nav2, results):
     map_file = config / "duel_arena_map.yaml"
     arena_file = config / "arena_example.yaml"
     expected_scores = {"sword_a": 0, "shield_b": 0}
-    if use_nav2:
+    round_trace = None
+    if full_round:
+        map_file, arena_file, arena, round_routes = prepare_round(
+            config / "round_example.yaml", output
+        )
+    elif use_nav2:
         measurements = yaml.safe_load((config / "measurements_example.yaml").read_bytes())
         measurements["start_poses"]["shield_b"][:2] = [1.80, 1.80]
         arena_file = output / "acceptance_arena.yaml"
@@ -113,25 +121,42 @@ def run_acceptance(output, domains, use_nav2, results):
         ]
         nodes, executors = zip(*endpoints, strict=True)
         telemetry = {}
+        active_stops = {}
         radar_topic = "/duel/radar_diagnostics"
         cloud_topic = "/duel/radar_unexpected"
-        for node, domain in zip(nodes, domains, strict=True):
+
+        def receive(message, domain, robot, topic):
+            telemetry[(domain, topic)] = message
+            if topic != "/simulation/ground_truth":
+                return
+            header = message.header.stamp
+            stamp = header.sec * 10**9 + header.nanosec
+            if robot in active_stops:
+                active_stops[robot].observe(
+                    stamp, time.monotonic_ns(), wheel_is_stationary(message.twist.twist)
+                )
+            if round_trace is not None:
+                position = message.pose.pose.position
+                round_trace.observe(robot, stamp, (position.x, position.y))
+
+        for node, domain, robot in zip(nodes, domains, ROBOT_IDS, strict=True):
             for kind, topic in (
                 (Bool, "/duel/peer_online"),
                 (Odometry, "/simulation/ground_truth"),
+                (String, "/duel/local_status"),
                 (String, "/duel/scoreboard"),
                 (String, radar_topic),
                 (PointCloud, cloud_topic),
             ):
                 node.create_subscription(
                     kind, topic,
-                    lambda msg, key=(domain, topic): telemetry.__setitem__(key, msg),
+                    lambda msg, d=domain, r=robot, t=topic: receive(msg, d, r, t),
                     qos_profile_sensor_data,
                 )
 
         def spin():
             for executor in executors:
-                for _ in range(6):
+                for _ in range(8):
                     executor.spin_once(timeout_sec=0.0)
 
         # 仿真验收使用本机空闲域，启动前留出发现其他节点的时间。
@@ -145,26 +170,48 @@ def run_acceptance(output, domains, use_nav2, results):
                 f"ROS 域 {domain} 已有其他节点，需选用空闲域",
             )
 
-        with ExitStack() as ports:
-            sockets = [
-                ports.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
-                for _ in domains
-            ]
-            for udp in sockets:
-                udp.bind(("127.0.0.1", 0))
-            port_a, port_b = [udp.getsockname()[1] for udp in sockets]
+        link = SimulationLink(resources)
+        port_a, port_b = (endpoint[1] for endpoint in link.vehicles)
+        peer_a, peer_b = link.ports
         log = resources.enter_context((output / "duel_sim.log").open("w", encoding="utf-8"))
         launch = subprocess.Popen(
             [
                 "ros2", "launch", "alohamini_duel", "duel_sim.launch.py",
                 f"domain_a:={domains[0]}", f"domain_b:={domains[1]}",
                 f"port_a:={port_a}", f"port_b:={port_b}",
+                f"peer_port_a:={peer_a}", f"peer_port_b:={peer_b}",
+                f"start_base_b:={str(use_nav2).lower()}",
                 f"use_nav2:={str(use_nav2).lower()}", "radar_diagnostics:=true",
                 f"arena:={arena_file}", f"map:={map_file}",
             ],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
         resources.callback(stop_process, launch)
+
+        def start_process(argv, domain, log_file):
+            log = resources.enter_context(log_file.open("w", encoding="utf-8"))
+            process = subprocess.Popen(
+                argv, env=os.environ | {"ROS_DOMAIN_ID": str(domain)},
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            resources.callback(stop_process, process)
+            return process
+
+        def start_second_base(log_file):
+            executable = Path(get_package_prefix("alohamini_duel")) / "lib/alohamini_duel/duel_base"
+            settings = {
+                "use_sim_time": "true", "simulation_controls": "true", "referee_status": "true",
+                "robot_id": ROBOT_IDS[1], "arena": str(arena_file), "map": str(map_file),
+                "bind_ip": "127.0.0.1", "bind_port": str(port_b),
+                "peer_ip": "127.0.0.1", "peer_port": str(peer_b),
+            }
+            arguments = [str(executable), "--ros-args"]
+            for name, value in settings.items():
+                arguments.extend(("-p", f"{name}:={value}"))
+            return start_process(arguments, domains[1], log_file)
+
+        if not use_nav2:
+            second_base = start_second_base(output / "base_b.log")
 
         def deactivate_navigation():
             if launch.poll() is not None:
@@ -194,7 +241,7 @@ def run_acceptance(output, domains, use_nav2, results):
                     return
                 if action is not None:
                     action()
-                time.sleep(0.04)
+                time.sleep(0.02)
             raise RuntimeError(description)
 
         def both_online():
@@ -215,15 +262,15 @@ def run_acceptance(output, domains, use_nav2, results):
         def stationary():
             return all(wheel_is_stationary(truth(domain).twist.twist) for domain in domains)
 
-        def switch(topic, enabled):
-            client = nodes[0].create_client(SetBool, topic)
+        def switch(topic, enabled, index=0):
+            client = nodes[index].create_client(SetBool, topic)
             try:
                 wait_for(client.service_is_ready, 5, f"未发现仿真服务 {topic}")
                 request = client.call_async(SetBool.Request(data=enabled))
                 wait_for(request.done, 5, f"仿真服务调用超时 {topic}")
                 require(request.result().success, f"仿真服务拒绝请求 {topic}")
             finally:
-                nodes[0].destroy_client(client)
+                nodes[index].destroy_client(client)
 
         wait_for(
             lambda: both_online() and all(scoreboard(domain).get("ready") for domain in domains)
@@ -236,7 +283,7 @@ def run_acceptance(output, domains, use_nav2, results):
         def radar_ready(domain):
             cloud = telemetry.get((domain, cloud_topic))
             summary = read_json(domain, radar_topic)
-            if cloud is None or not cloud.points:
+            if cloud is None or not (full_round or cloud.points):
                 return False
             stamp = cloud.header.stamp
             return (
@@ -265,34 +312,155 @@ def run_acceptance(output, domains, use_nav2, results):
         nodes[0].destroy_publisher(extra)
         results["只读预检与速度冲突检测"] = True
 
-        switch("/alohamini_nav_sim/command_enable", True)
-        switch("/alohamini_duel_base/command_enable", True)
-        route = command("duel_route", "--robot-id", "sword_a", "--timeout", "35")
+        def play_round(round_id):
+            publishers = [node.create_publisher(String, "/duel/choice", 1) for node in nodes]
+
+            def submit_choices():
+                for source, choice in zip(publishers, ("left", "right"), strict=True):
+                    source.publish(String(data=f"{round_id}:{choice}"))
+
+            wait_for(
+                lambda: all(scoreboard(domain).get("round") == round_id + 1 for domain in domains),
+                5, "两域未收到相同回合编号", submit_choices,
+            )
+            first_score = scoreboard(domains[0])
+            require(first_score == scoreboard(domains[1]), "两域裁判结果不一致")
+            require(first_score["scores"] == expected_scores, f"电子判分异常：{first_score}")
+            results["电子判分"] = first_score
+
+        def finish():
+            deactivated = deactivate_navigation()
+            stop_process(launch)
+            require(deactivated, "仿真导航生命周期停机失败，详见 map_session_stop.log")
+            require(
+                launch.returncode == 0
+                and "process has died" not in (output / "duel_sim.log").read_text(encoding="utf-8"),
+                "仿真存在异常退出",
+            )
+            results["有序停机"] = True
+
+        for index in range(2 if full_round or not use_nav2 else 1):
+            switch("/alohamini_nav_sim/command_enable", True, index)
+            switch("/alohamini_duel_base/command_enable", True, index)
+        if use_nav2:
+            params = yaml.safe_load(Path(model_config("alohamini2edu", "nav2")).read_bytes())
+            tolerance = params["controller_server"]["ros__parameters"]["general_goal_checker"][
+                "xy_goal_tolerance"
+            ]
+
+        def goal_distance(domain, goal):
+            position = truth(domain).pose.pose.position
+            return math.hypot(position.x - goal[0], position.y - goal[1])
+
+        if full_round:
+            round_trace = RoundTrace(arena)
+            round_id = scoreboard(domains[0])["round"]
+            waypoints = {robot: load_route(path, arena) for robot, path in round_routes.items()}
+            arrivals = {robot: [] for robot in ROBOT_IDS}
+            for stage, goals in enumerate(zip(*waypoints.values(), strict=True), 1):
+                routes = []
+                for robot, domain, goal in zip(ROBOT_IDS, domains, goals, strict=True):
+                    pose_file = output / f"round_{robot}_{stage}.yaml"
+                    pose_file.write_text(yaml.safe_dump([list(goal)]), encoding="utf-8")
+                    log_file = output / f"round_{robot}_{stage}.log"
+                    route_command = command(
+                        "duel_route", "--robot-id", robot, "--timeout", "45",
+                        "--route", str(pose_file),
+                    )
+                    routes.append((start_process(route_command, domain, log_file), log_file))
+                wait_for(
+                    lambda: all(process.poll() is not None for process, _ in routes),
+                    52, f"双车第 {stage} 段绕箱路线超时",
+                )
+                for process, log_file in routes:
+                    require(process.returncode == 0, log_file.read_text(encoding="utf-8"))
+                wait_for(
+                    lambda: stationary() and all(
+                        goal_distance(domain, goal) <= tolerance
+                        for domain, goal in zip(domains, goals, strict=True)
+                    ),
+                    3, f"双车第 {stage} 段绕箱路线未到达并停稳",
+                )
+                for robot, domain, goal in zip(ROBOT_IDS, domains, goals, strict=True):
+                    pose = truth(domain).pose.pose
+                    arrivals[robot].append({
+                        "目标_m": list(goal[:2]), "真值_m": [pose.position.x, pose.position.y],
+                        "真值朝向_rad": yaw_from_quaternion(pose.orientation),
+                        "平面误差_m": goal_distance(domain, goal),
+                    })
+            require(
+                all(scoreboard(domain).get("round") == round_id for domain in domains),
+                "双车绕箱期间回合被中断",
+            )
+            require(round_trace.count > 50 and round_trace.max_gap <= 0.20,
+                    f"双域真值采样间隔过长 {round_trace.max_gap:.3f} 秒")
+            results["双车绕箱"] = {
+                "回合": round_id, "航点": arrivals, "墙和箱体净空通过": True,
+                "最小中心距_m": round_trace.min_distance, "配对真值帧数": round_trace.count,
+                "最大采样间隔_s": round_trace.max_gap,
+                "判分定位_m_rad": {
+                    robot: read_json(domain, "/duel/local_status")["pose"]
+                    for robot, domain in zip(ROBOT_IDS, domains, strict=True)
+                },
+            }
+            play_round(round_id)
+            require(
+                results["电子判分"]["result"] == "双方未进入判分条件",
+                "独立路线结束后的判分结果异常",
+            )
+            finish()
+            return
+
+        route = command("duel_route", "--robot-id", ROBOT_IDS[0], "--timeout", "35")
         if use_nav2:
             route_file = config / "route_example.yaml"
-            x, y, _ = load_route(route_file, arena)[-1]
-            params = yaml.safe_load(Path(model_config("alohamini2edu", "nav2")).read_bytes())
-            goal_checker = params["controller_server"]["ros__parameters"]["general_goal_checker"]
-
-            def goal_distance():
-                position = truth(domains[0]).pose.pose.position
-                return math.hypot(position.x - x, position.y - y)
-
+            goal = load_route(route_file, arena)[-1]
             run([*route, "--route", str(route_file)], 40, domain=domains[0])
             wait_for(
-                lambda: goal_distance() <= goal_checker["xy_goal_tolerance"] and stationary(),
+                lambda: goal_distance(domains[0], goal) <= tolerance and stationary(),
                 3, "仿真车未驶入目标航点邻域并停稳",
             )
             position = truth(domains[0]).pose.pose.position
             results["固定航点终点"] = [position.x, position.y]
-            results["固定航点平面误差_m"] = goal_distance()
+            results["固定航点平面误差_m"] = goal_distance(domains[0], goal)
 
-        velocity = nodes[0].create_publisher(Twist, "/cmd_vel_duel", 1)
+        velocity = [
+            node.create_publisher(Twist, "/cmd_vel_duel", 1)
+            for node in (nodes[:1] if use_nav2 else nodes)
+        ]
         move = Twist()
         move.linear.x = 0.1
 
         def drive():
-            velocity.publish(move)
+            for publisher in velocity:
+                publisher.publish(move)
+
+        def start_timing(injected_ns):
+            active_stops.update((robot, GroundStop(injected_ns)) for robot in ROBOT_IDS)
+
+        def stopped_with_evidence():
+            return all(evidence.stopped_s is not None for evidence in active_stops.values())
+
+        def timing_report():
+            elapsed = {robot: evidence.stopped_s for robot, evidence in active_stops.items()}
+            confirmed = {
+                robot: evidence.confirmed_s for robot, evidence in active_stops.items()
+            }
+            active_stops.clear()
+            maximum = max(elapsed.values())
+            return {
+                "双车停稳_s": elapsed, "双车停稳确认_s": confirmed,
+                "最迟停稳_s": maximum, "0.5秒内停稳": maximum <= 0.5,
+            }
+
+        def referee_paused():
+            return all(not scoreboard(domain).get("ready") for domain in domains)
+
+        def both_offline():
+            return all(not telemetry[(domain, "/duel/peer_online")].data for domain in domains)
+
+        def recovered():
+            return both_online() and all(scoreboard(domain).get("ready") for domain in domains)
 
         watch_path = output / "stop_watch.log"
         watch_report = output / "stop_watch.json"
@@ -324,7 +492,10 @@ def run_acceptance(output, domains, use_nav2, results):
                 5, "第二条路线未启动",
             )
         def moving():
-            return truth(domains[0]).twist.twist.linear.x > (0.025 if use_nav2 else 0.05)
+            return all(
+                truth(domain).twist.twist.linear.x > (0.025 if use_nav2 else 0.05)
+                for domain in (domains[:1] if use_nav2 else domains)
+            )
 
         wait_for(moving, 8, "故障注入前未观察到仿真车运动", drive if not use_nav2 else None)
         if not use_nav2:
@@ -333,13 +504,12 @@ def run_acceptance(output, domains, use_nav2, results):
                 lambda: moving() and time.monotonic() - moving_at >= 0.25,
                 2, "故障注入前仿真车未保持运动", drive,
             )
-        switch("/alohamini_duel_base/peer_link_enable", False)
+        start_timing(link.set_mode("cut"))
         wait_for(
-            lambda: all(not telemetry[(domain, "/duel/peer_online")].data for domain in domains)
-            and all(not scoreboard(domain).get("ready") for domain in domains)
-            and stationary(),
+            lambda: both_offline() and referee_paused() and stopped_with_evidence(),
             4, "断联后底盘或裁判未停", drive,
         )
+        results["故障注入到停稳"] = timing_report()
         stopped_at = time.monotonic()
 
         def sustained_stop():
@@ -378,41 +548,76 @@ def run_acceptance(output, domains, use_nav2, results):
             4, "断联后雷达诊断未继续更新",
         )
         results["断联时雷达仍更新"] = True
-        switch("/alohamini_duel_base/peer_link_enable", True)
-        wait_for(
-            lambda: both_online() and all(scoreboard(domain).get("ready") for domain in domains),
-            8, "重连后双车未重新上线",
-        )
+        link.set_mode("normal")
+        wait_for(recovered, 8, "重连后双车未重新上线")
         if use_nav2:
             stopped_at = time.monotonic()
             wait_for(sustained_stop, 2, "重连后被取消的任务恢复运动")
         results["重连"] = True
 
-        round_id = scoreboard(domains[0])["round"]
-        publishers = [node.create_publisher(String, "/duel/choice", 1) for node in nodes]
+        if not use_nav2:
+            fault_report = {}
+            results["扩展网络故障"] = fault_report
+            link.set_mode("loss")
 
-        def submit_choices():
-            for source, choice in zip(publishers, ("left", "right"), strict=True):
-                source.publish(String(data=f"{round_id}:{choice}"))
+            def confirms_loss():
+                require(recovered(), "部分丢包期间联机状态意外失效")
+                counts = link.snapshot()
+                return counts["丢弃"] >= 10 and counts["转发"] >= 20
 
-        wait_for(
-            lambda: all(scoreboard(domain).get("round") == round_id + 1 for domain in domains),
-            5, "两域未收到相同回合编号", submit_choices,
-        )
-        first_score = scoreboard(domains[0])
-        require(first_score == scoreboard(domains[1]), "两域裁判结果不一致")
-        require(first_score["scores"] == expected_scores, f"电子判分异常：{first_score}")
-        results["电子判分"] = first_score
+            wait_for(confirms_loss, 4, "部分丢包样本不足")
+            fault_report["每三包丢一包"] = link.snapshot()
+            link.set_mode("normal")
 
-        deactivated = deactivate_navigation()
-        stop_process(launch)
-        require(deactivated, "仿真导航生命周期停机失败，详见 map_session_stop.log")
-        require(
-            launch.returncode == 0
-            and "process has died" not in (output / "duel_sim.log").read_text(encoding="utf-8"),
-            "仿真存在异常退出",
-        )
-        results["有序停机"] = True
+            wait_for(moving, 5, "延迟故障注入前双车未移动", drive)
+            start_timing(link.set_mode("delay"))
+            wait_for(
+                lambda: both_offline() and referee_paused() and stopped_with_evidence(),
+                4, "单向延迟后双车或裁判未停", drive,
+            )
+            delay = timing_report()
+            wait_for(
+                lambda: link.snapshot()["延迟转发"] >= 3,
+                3, "未观察到实际延迟转发", drive,
+            )
+            require(both_offline() and stationary(), "迟到的心跳使车辆提前恢复")
+            fault_report["单向延迟"] = {"延迟_s": DELAY_S, **delay, **link.snapshot()}
+            link.set_mode("normal")
+            wait_for(recovered, 8, "移除延迟后双车未重新上线")
+
+            status_topic = "/duel/local_status"
+            sessions = [read_json(domain, status_topic)["session_id"] for domain in domains]
+            wait_for(moving, 5, "进程退出前双车未移动", drive)
+            start_timing(time.monotonic_ns())
+            second_base.kill()
+            wait_for(
+                lambda: second_base.poll() is not None
+                and not telemetry[(domains[0], "/duel/peer_online")].data
+                and referee_paused() and stopped_with_evidence(),
+                6, "对端进程退出后双车或裁判未停", drive,
+            )
+            restart = timing_report()
+            require(second_base.returncode == -signal.SIGKILL, "对端仿真底盘未被故障信号终止")
+            new_base = start_second_base(output / "base_b_restart.log")
+            wait_for(
+                lambda: recovered() and read_json(domains[1], status_topic).get("session_id")
+                != sessions[1] and stationary(),
+                10, "重启后双车未通过新会话恢复并保持静止",
+            )
+            current_sessions = [read_json(domain, status_topic)["session_id"] for domain in domains]
+            require(current_sessions[0] == sessions[0], "本车底盘进程意外重启")
+            require(
+                read_json(domains[1], status_topic)["motion_enabled"] is False
+                and new_base.poll() is None,
+                "重启后的对端底盘未保持默认禁用",
+            )
+            fault_report["对端底盘进程重启"] = {
+                **restart, "旧进程": second_base.pid, "新进程": new_base.pid,
+                "旧会话": sessions[1], "新会话": current_sessions[1], "重启后运动默认禁用": True,
+            }
+
+        play_round(scoreboard(domains[0])["round"])
+        finish()
 
 
 def main(argv=None):
@@ -420,7 +625,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="新增的报告目录")
     parser.add_argument("--domains", nargs=2, type=int, default=(73, 74))
-    parser.add_argument("--no-nav2", action="store_true", help="验收纯定位模式")
+    scenario = parser.add_mutually_exclusive_group()
+    scenario.add_argument("--no-nav2", action="store_true", help="验收纯定位与扩展网络故障")
+    scenario.add_argument("--round", action="store_true", help="验收双车绕箱与完整电子回合")
     args = parser.parse_args(argv)
     if len(set(args.domains)) != 2 or not all(0 <= domain <= 101 for domain in args.domains):
         parser.error("需要两个不同的 ROS 域编号，范围为 0 至 101")
@@ -432,9 +639,12 @@ def main(argv=None):
             parser.error(f"无法创建报告目录：{error}")
     output = output.resolve()
     results = {}
-    report = {"通过": False, "ROS域": args.domains, "启用Nav2": not args.no_nav2, "检查": results}
+    report = {
+        "通过": False, "ROS域": args.domains, "启用Nav2": not args.no_nav2,
+        "双车绕箱场景": args.round, "检查": results,
+    }
     try:
-        run_acceptance(output, args.domains, not args.no_nav2, results)
+        run_acceptance(output, args.domains, not args.no_nav2, args.round, results)
         report["通过"] = True
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         report["失败原因"] = str(error)

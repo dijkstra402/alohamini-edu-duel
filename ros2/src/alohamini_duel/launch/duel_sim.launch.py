@@ -29,6 +29,9 @@ def _nodes(context):
         raise ValueError("两辆仿真车需要不同的 ROS 域编号，范围为 0 至 101")
     if any(not 1024 <= int(port) <= 65535 for port in ports) or len(set(map(int, ports))) != 2:
         raise ValueError("两辆仿真车需要不同的 UDP 端口，范围为 1024 至 65535")
+    peers = (value("peer_port_a") or ports[1], value("peer_port_b") or ports[0])
+    if any(not 1024 <= int(port) <= 65535 for port in peers):
+        raise ValueError("仿真对端 UDP 端口必须在 1024 至 65535")
     cyclone_config = Path(get_package_share_directory("alohamini_duel"))
     local_env = {
         "ROS_LOCALHOST_ONLY": "1",
@@ -55,7 +58,8 @@ def _nodes(context):
                 "ros2", "launch", "alohamini_duel", "duel_vehicle_sim.launch.py",
                 f"robot_id:={robot_id}", f"arena:={arena}", f"map:={map_file}",
                 "bind_ip:=127.0.0.1", f"bind_port:={ports[index]}",
-                "peer_ip:=127.0.0.1", f"peer_port:={ports[1 - index]}",
+                "peer_ip:=127.0.0.1", f"peer_port:={peers[index]}",
+                f"start_base:={'true' if index == 0 else value('start_base_b')}",
                 f"use_nav2:={value('use_nav2')}",
                 f"radar_diagnostics:={value('radar_diagnostics')}",
                 f"use_rviz:={value('use_rviz')}",
@@ -90,6 +94,9 @@ def generate_launch_description():
         "domain_b": "46",
         "port_a": "5588",
         "port_b": "5589",
+        "peer_port_a": "",
+        "peer_port_b": "",
+        "start_base_b": "true",
         "use_rviz": "false",
         "use_nav2": "false",
         "radar_diagnostics": "false",
