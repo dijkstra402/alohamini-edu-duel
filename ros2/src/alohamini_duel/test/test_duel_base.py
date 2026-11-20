@@ -2,6 +2,7 @@ import json
 import math
 import select
 import socket
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,51 @@ def test_udp_socket_receives_only_the_configured_peer(arena):
             assert select.select([local], [], [], 1)[0]
             a.accept(local.recv(1024), 3)
             assert a.remote.pose == POSE_B
+
+
+def test_heartbeat_tick_acknowledges_packet_already_in_socket(arena, tmp_path):
+    rclpy = pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from geometry_msgs.msg import TransformStamped
+    from nav_msgs.msg import Odometry
+    from rclpy.signals import SignalHandlerOptions
+
+    from alohamini_duel.base_node import DuelBase
+
+    config = Path(__file__).parents[1] / "config/arena_example.yaml"
+    with ExitStack() as resources:
+        remote = resources.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        remote.bind(("127.0.0.1", 0))
+        remote.settimeout(1)
+        rclpy.init(
+            args=[
+                "--ros-args", "-p", f"arena:={config}", "-p", f"map:={tmp_path / 'map.yaml'}",
+                "-p", f"robot_id:={ROBOT_IDS[0]}", "-p", "bind_ip:=127.0.0.1",
+                "-p", "bind_port:=0", "-p", "peer_ip:=127.0.0.1",
+                "-p", f"peer_port:={remote.getsockname()[1]}",
+            ],
+            domain_id=91,
+            signal_handler_options=SignalHandlerOptions.NO,
+        )
+        resources.callback(rclpy.try_shutdown)
+        base = DuelBase()
+        resources.callback(base.destroy_node)
+        stamp = base.get_clock().now().to_msg()
+        transform = TransformStamped()
+        transform.header.frame_id, transform.child_frame_id = "map", "base_link"
+        transform.header.stamp = stamp
+        transform.transform.translation.x, transform.transform.translation.y = POSE_A[:2]
+        transform.transform.rotation.w = 1.0
+        base.tf.set_transform(transform, "心跳测试")
+        odometry = Odometry()
+        odometry.header.stamp = stamp
+        base._odom(odometry)
+        peer = PeerLink(ROBOT_IDS[1], arena)
+        remote.sendto(peer.encode(POSE_B, 0.0, 0.0, 1.0), base.udp.getsockname())
+        assert select.select([base.udp], [], [], 1)[0]
+        base._tick()
+        heartbeat = json.loads(remote.recv(1024))
+        assert heartbeat["ack_session_id"] == peer.session_id
+        assert heartbeat["ack_seq"] == peer.seq
 
 
 def test_arbitration_priority_timeout_and_stop_recovery(arena):

@@ -124,11 +124,7 @@ class DuelBase(Node):
         now = time.monotonic()
         stamp = self.get_clock().now()
         local = self._local_state(stamp.nanoseconds, now)
-        if local is not None and self.forward_peer_packets:
-            try:
-                self.udp.send(self.link.encode(*local, now=now))
-            except OSError:
-                self.get_logger().warning("UDP 心跳发送失败", throttle_duration_sec=3.0)
+        # 本轮发出的确认应包含已经到达的报文，避免多占用一个心跳周期。
         for _ in range(16):
             try:
                 data = self.udp.recv(MAX_PACKET_BYTES + 1)
@@ -139,10 +135,22 @@ class DuelBase(Node):
                 break
             if self.forward_peer_packets:
                 self.link.accept(data, now)
+        if local is not None and self.forward_peer_packets:
+            try:
+                self.udp.send(self.link.encode(*local, now=now))
+            except OSError:
+                self.get_logger().warning("UDP 心跳发送失败", throttle_duration_sec=3.0)
         peer = self.link.online(now) if local is not None else None
         online = peer is not None
         if online != self.online:
-            self.get_logger().info("双向心跳已就绪" if online else "定位或心跳中断，输出零速")
+            message = "双向心跳已就绪" if online else "本机定位失效，输出零速"
+            if not online and local is not None:
+                message = (
+                    f"双向心跳失效，输出零速。报文年龄 {now - self.link.remote.received_at:.3f} 秒，"
+                    f"确认年龄 {now - self.link.acked_sent_at:.3f} 秒，"
+                    f"连续收包 {self.link.consecutive}，连续确认 {self.link.ack_consecutive}"
+                )
+            self.get_logger().info(message)
             self.online = online
         self.online_pub.publish(Bool(data=online))
         if self.status_pub is not None:
