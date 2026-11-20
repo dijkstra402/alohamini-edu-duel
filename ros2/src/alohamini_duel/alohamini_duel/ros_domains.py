@@ -1,10 +1,13 @@
-"""为双车进程分别创建两个 ROS 上下文。"""
+"""管理双车进程的 ROS 上下文与关停。"""
 
 import argparse
 import signal
+from contextlib import ExitStack
 
+import rclpy
 from rclpy.context import Context
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.signals import SignalHandlerOptions
 from rclpy.utilities import remove_ros_args
 
 
@@ -49,3 +52,20 @@ def watch_shutdown(resources):
         previous = signal.signal(signum, request_stop)
         resources.callback(signal.signal, signum, previous)
     return lambda: requested
+
+
+def spin_until_shutdown(create_node, args=None):
+    with ExitStack() as resources:
+        requested = watch_shutdown(resources)
+        rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+        resources.callback(rclpy.try_shutdown)
+        node = create_node()
+        resources.callback(node.destroy_node)
+        executor = SingleThreadedExecutor(context=node.context)
+        resources.callback(executor.shutdown)
+        executor.add_node(node)
+        try:
+            while node.context.ok() and not requested():
+                executor.spin_once(timeout_sec=0.05)
+        except ExternalShutdownException:
+            pass

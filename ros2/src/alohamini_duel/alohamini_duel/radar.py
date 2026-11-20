@@ -90,16 +90,16 @@ def compare_scan(grid, laser_pose, ranges, angle_min, angle_increment, limits, t
 
 
 def main(args=None):
-    import rclpy
     from geometry_msgs.msg import Point32
     from nav_msgs.msg import OccupancyGrid
-    from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
     from rclpy.time import Time
     from sensor_msgs.msg import LaserScan, PointCloud
     from std_msgs.msg import String
     from tf2_ros import Buffer, TransformException, TransformListener
+
+    from .ros_domains import spin_until_shutdown
 
     class RadarDiagnostic(Node):
         def __init__(self):
@@ -173,14 +173,4 @@ def main(args=None):
             self.cloud.publish(cloud)
             self.summary.publish(String(data=json.dumps({"stamp_ns": stamp, **counts})))
 
-    rclpy.init(args=args)
-    node = None
-    try:
-        node = RadarDiagnostic()
-        rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
-        pass
-    finally:
-        if node is not None:
-            node.destroy_node()
-        rclpy.try_shutdown()
+    spin_until_shutdown(RadarDiagnostic, args)

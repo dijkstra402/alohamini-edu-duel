@@ -330,9 +330,12 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             require(first_score["scores"] == expected_scores, f"电子判分异常：{first_score}")
             results["电子判分"] = first_score
 
-        def finish():
+        def finish(external_base=None):
             deactivated = deactivate_navigation()
             stop_process(launch)
+            if external_base is not None:
+                stop_process(external_base)
+                require(external_base.returncode == 0, "外部底盘进程未正常退出")
             require(deactivated, "仿真导航生命周期停机失败，详见 map_session_stop.log")
             require(
                 launch.returncode == 0
@@ -624,7 +627,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             }
 
         play_round(scoreboard(domains[0])["round"])
-        finish()
+        finish(new_base if not use_nav2 else None)
         require(not missed_deadlines, f"停稳超过 0.5 秒。{'、'.join(missed_deadlines)}")
 
 

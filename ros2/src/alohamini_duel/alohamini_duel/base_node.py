@@ -4,12 +4,10 @@ import json
 import math
 import time
 
-import rclpy
 from alohamini.schema import BodyVelocity
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.clock import Clock, ClockType
-from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -20,6 +18,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from .arena import ROBOT_IDS, Arena
 from .cmd_vel_arbiter import STOP, VelocityArbiter
 from .peer_sync import HEARTBEAT_PERIOD, MAX_PACKET_BYTES, PeerLink, open_peer_socket
+from .ros_domains import spin_until_shutdown
 from .status import yaw_from_quaternion
 
 MAX_POSE_AGE = 0.35
@@ -178,14 +177,4 @@ class DuelBase(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = None
-    try:
-        node = DuelBase()
-        rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
-        pass
-    finally:
-        if node is not None:
-            node.destroy_node()
-        rclpy.try_shutdown()
+    spin_until_shutdown(DuelBase, args)

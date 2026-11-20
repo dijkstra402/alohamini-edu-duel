@@ -150,3 +150,29 @@ def test_dual_domain_shutdown_waits_for_executor_loop(signum):
         signal.raise_signal(signum)
         assert requested()
     assert signal.getsignal(signum) == previous
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_single_domain_shutdown_preserves_inflight_ros_publication(signum):
+    rclpy = pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_duel.ros_domains import spin_until_shutdown
+    from rclpy.node import Node
+    from std_msgs.msg import String
+
+    published = []
+
+    def create_node():
+        node = Node("duel_shutdown_test")
+        publisher = node.create_publisher(String, "/duel/shutdown_test", 1)
+
+        def publish_during_shutdown():
+            signal.raise_signal(signum)
+            publisher.publish(String(data="关停回调完成"))
+            published.append(rclpy.ok())
+
+        node.create_timer(0.02, publish_during_shutdown)
+        return node
+
+    spin_until_shutdown(create_node, [])
+    assert published == [True]
+    assert not rclpy.ok()
