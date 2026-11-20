@@ -26,6 +26,7 @@ setup(
             "duel_base = alohamini_duel.base_node:main",
             "shared_duel_sim = alohamini_duel.sim_node:main",
             "duel_referee = alohamini_duel.referee_node:main",
+            "duel_check = alohamini_duel.preflight:main",
         ]
     },
 )

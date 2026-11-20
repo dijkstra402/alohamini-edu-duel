@@ -7,11 +7,15 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.utilities import remove_ros_args
 
 
-def parse_dual_domain_args(description, args, defaults):
+def dual_domain_parser(description, defaults):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--arena", required=True)
     parser.add_argument("--map", required=True)
     parser.add_argument("--domains", nargs=2, type=int, default=defaults)
+    return parser
+
+
+def parse_dual_domain_args(parser, args):
     arguments = parser.parse_args(remove_ros_args()[1:] if args is None else args)
     if len(set(arguments.domains)) != 2 or not all(
         0 <= domain <= 101 for domain in arguments.domains

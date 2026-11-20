@@ -7,12 +7,12 @@ from alohamini_nav_sim.node import STEP_PERIOD, Simulator
 from rclpy.executors import ExternalShutdownException
 
 from .arena import Arena
-from .ros_domains import attach_domain, parse_dual_domain_args
+from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
 from .shared_sim_world import SharedDuelWorld
 
 
 def main(args=None):
-    arguments = parse_dual_domain_args(__doc__, args, (45, 46))
+    arguments = parse_dual_domain_args(dual_domain_parser(__doc__, (45, 46)), args)
     arena = Arena.load(arguments.arena, arguments.map)
     world = SharedDuelWorld(arena)
     with ExitStack() as resources:

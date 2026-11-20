@@ -134,6 +134,28 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
             40,
             "双车定位或心跳未就绪",
         )
+        config = Path(__file__).parents[1] / "config"
+        preflight = [
+            "ros2", "run", "alohamini_duel", "duel_check", "--simulation",
+            "--arena", str(config / "arena_example.yaml"),
+            "--map", str(config / "duel_arena_map.yaml"),
+            "--domains", *(str(domain) for domain in domains),
+            "--duration", "2",
+        ]
+        checked = subprocess.run(preflight, capture_output=True, text=True, timeout=8, check=False)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+        assert json.loads(checked.stdout)["通过"]
+
+        unexpected_publisher = nodes[0].create_publisher(Twist, "/cmd_vel", 1)
+        checked = subprocess.run(preflight, capture_output=True, text=True, timeout=8, check=False)
+        assert checked.returncode == 1, checked.stdout + checked.stderr
+        # Humble 的 ros2 run 会在失败退出时向报告后追加退出说明。
+        response, _ = json.JSONDecoder().raw_decode(checked.stdout)
+        report = response["双车"]
+        assert not report["sword_a"]["检查"]["速度链路只有一个仲裁和一个监测出口"]
+        assert "duel_pipeline_test_73" in report["sword_a"]["速度源"]
+        nodes[0].destroy_publisher(unexpected_publisher)
+
         switch_service("/alohamini_nav_sim/command_enable", True)
         switch_service("/alohamini_duel_base/command_enable", True)
         publisher = nodes[0].create_publisher(Twist, "/cmd_vel_duel", 1)

@@ -154,6 +154,7 @@ class DuelBase(Node):
                 "seq": self.status_seq,
                 "pose": local[0] if local is not None else None,
                 "online": online,
+                "motion_enabled": self.arbiter.enabled,
             }
             self.status_pub.publish(String(data=json.dumps(status)))
         if peer is not None and peer.received_at == now:

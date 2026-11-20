@@ -9,6 +9,7 @@ from alohamini.schema import BodyVelocity
 from alohamini_duel.arena import BASE_RADIUS, ROBOT_IDS, Arena
 from alohamini_duel.cmd_vel_arbiter import MAX_SPEED, STOP, VelocityArbiter
 from alohamini_duel.peer_sync import PeerLink, PeerState, open_peer_socket
+from alohamini_duel.status import VehicleStatus
 
 POSE_A = (1.45, 1.4, 0.0)
 POSE_B = (2.4, 2.45, math.pi)
@@ -50,6 +51,30 @@ def test_map_fingerprint_includes_grid_and_invalid_start_is_rejected(arena, tmp_
     config.write_text(src.read_text().replace("0.55, 0.55", "0.05, 0.05"))
     with pytest.raises(ValueError, match="底盘净空"):
         Arena.load(config, map_file)
+
+
+def test_vehicle_status_distinguishes_motion_permission_and_validates_identity(arena):
+    frame = {
+        "robot_id": ROBOT_IDS[0],
+        "arena_id": arena.fingerprint,
+        "session_id": "本车会话",
+        "seq": 1,
+        "online": False,
+        "pose": POSE_A,
+    }
+    legacy = VehicleStatus.decode(json.dumps(frame), ROBOT_IDS[0], arena)
+    assert legacy.motion_enabled is None and legacy.pose == POSE_A and not legacy.online
+    disabled = VehicleStatus.decode(
+        json.dumps(frame | {"motion_enabled": False}), ROBOT_IDS[0], arena
+    )
+    assert disabled.motion_enabled is False
+    for invalid in (
+        {"arena_id": "不同地图"},
+        {"robot_id": ROBOT_IDS[1]},
+        {"motion_enabled": "false"},
+        {"online": True, "pose": None},
+    ):
+        assert VehicleStatus.decode(json.dumps(frame | invalid), ROBOT_IDS[0], arena) is None
 
 
 def test_udp_clock_origin_order_restart_and_old_session(arena):

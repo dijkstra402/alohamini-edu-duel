@@ -24,3 +24,15 @@ Status: implemented
 在项目支持的 Ubuntu ROS 2 环境中用 `bash ros2/build.bash --base-paths src ../simulation/navigation --packages-up-to alohamini_duel` 构建，再用 `ros2 launch alohamini_duel duel_hw.launch.py` 传入本机编号、地图、标定文件、Host 和对端 PC 地址。Bridge 和底盘仲裁各自保留运动使能。启动先核对停放位置、定位和双向心跳。
 
 共享仿真与记分规则见 [双车共享仿真](2026-11-20-edu-duel-simulation.md)。
+
+## 实机只读预检
+
+两车机械臂收拢，分别停在标定点。使用同一份地图和场地标定，在两车的 `duel_hw.launch.py` 加上 `referee_status:=true`。预检机须能通过 DDS 读取两车各自的域。
+
+```bash
+ros2 run alohamini_duel duel_check --arena 场地标定.yaml --map map.yaml --domains 5 6
+```
+
+预检读取地图指纹、双向心跳、雷达、IMU、轮速、两路速度、碰撞监测生命周期和 Bridge 参数与诊断。当数据过期、轮速非零、仲裁或 Bridge 已使能、出现多路速度发布者时返回失败。碰撞监测在静止时可停止重复发布零速，此时利用新鲜轮速核对静止反馈。报告包含每车距标定起点的偏差和名义净空，供现场核对实际停放位置。预检不调用使能服务，实际制动与定位精度需要现场测量。
+
+Humble 双域端到端测试验证正常静止时预检通过，并核实额外的速度发布者会令预检失败。相关回归共 42 项通过。

@@ -6,8 +6,9 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 
-from .arena import ROBOT_IDS, Arena, Pose, coordinates
+from .arena import ROBOT_IDS, Arena, Pose
 from .peer_sync import PEER_TIMEOUT
+from .status import VehicleStatus
 
 FIRST, SECOND = ROBOT_IDS
 MATCHING_CHOICE = {"left": "right", "center": "center", "right": "left"}
@@ -39,40 +40,26 @@ class Referee:
         self.result = "等待双方联机"
 
     def observe(self, robot_id, status, now):
-        try:
-            data = json.loads(status)
-            if data["robot_id"] != robot_id or data["arena_id"] != self.arena.fingerprint:
-                return
-            session, seq, online = data["session_id"], data["seq"], data["online"]
-            if (
-                not isinstance(session, str)
-                or not 1 <= len(session) <= 64
-                or type(seq) is not int
-                or seq < 1
-                or type(online) is not bool
-            ):
-                return
-            pose = coordinates(data["pose"], 3, "裁判位姿") if online else None
-        except (KeyError, TypeError, ValueError, RecursionError):
+        report = VehicleStatus.decode(status, robot_id, self.arena)
+        if report is None:
             return
-        if pose is not None and (not self.arena.contains(pose[:2]) or abs(pose[2]) > math.pi):
-            return
-        if (robot_id, session) in self.old_sessions:
+        pose = report.pose if report.online else None
+        if (robot_id, report.session_id) in self.old_sessions:
             return
         self.refresh(now)
         previous = self.players.get(robot_id)
-        if previous is not None and session != previous.session_id:
+        if previous is not None and report.session_id != previous.session_id:
             self.old_sessions.add((robot_id, previous.session_id))
             self.players.pop(robot_id)
             self.refresh(now)
             previous = None
-        if previous is not None and seq <= previous.seq:
+        if previous is not None and report.seq <= previous.seq:
             return
         streak = (
             previous.consecutive if previous and now - previous.received_at < PEER_TIMEOUT else 0
         )
         self.players[robot_id] = PlayerReport(
-            session, seq, pose, now, min(streak + 1, 3) if pose is not None else 0
+            report.session_id, report.seq, pose, now, min(streak + 1, 3) if pose is not None else 0
         )
         self.refresh(now)
 
@@ -138,9 +125,9 @@ def main(args=None):
     from rclpy.node import Node
     from std_msgs.msg import String
 
-    from .ros_domains import attach_domain, parse_dual_domain_args
+    from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
 
-    arguments = parse_dual_domain_args(__doc__, args, (5, 6))
+    arguments = parse_dual_domain_args(dual_domain_parser(__doc__, (5, 6)), args)
     referee = Referee(Arena.load(arguments.arena, arguments.map))
     with ExitStack() as resources:
         nodes, executors, publishers = [], [], []
