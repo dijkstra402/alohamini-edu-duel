@@ -7,7 +7,7 @@ from alohamini_nav_sim.node import STEP_PERIOD, Simulator
 from rclpy.executors import ExternalShutdownException
 
 from .arena import Arena
-from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
+from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args, watch_shutdown
 from .shared_sim_world import SharedDuelWorld
 
 
@@ -16,6 +16,7 @@ def main(args=None):
     arena = Arena.load(arguments.arena, arguments.map)
     world = SharedDuelWorld(arena)
     with ExitStack() as resources:
+        shutdown_requested = watch_shutdown(resources)
         domains = [
             attach_domain(
                 resources,
@@ -26,7 +27,7 @@ def main(args=None):
         ]
         nodes, executors = zip(*domains, strict=True)
         try:
-            while all(node.context.ok() for node in nodes):
+            while not shutdown_requested() and all(node.context.ok() for node in nodes):
                 start = time.monotonic()
                 for executor in executors:
                     for _ in range(4):

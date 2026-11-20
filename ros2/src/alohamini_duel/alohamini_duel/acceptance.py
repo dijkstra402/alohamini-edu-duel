@@ -105,7 +105,9 @@ def run_acceptance(output, domains, use_nav2, results):
         endpoints = [
             attach_domain(
                 resources, domain,
-                lambda ctx: Node(f"duel_acceptance_{os.getpid()}", context=ctx),
+                lambda ctx, domain=domain: Node(
+                    f"duel_acceptance_{domain}_{os.getpid()}", context=ctx
+                ),
             )
             for domain in domains
         ]

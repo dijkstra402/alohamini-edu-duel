@@ -1,6 +1,7 @@
 """为双车进程分别创建两个 ROS 上下文。"""
 
 import argparse
+import signal
 
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
@@ -34,3 +35,17 @@ def attach_domain(resources, domain, create_node):
     resources.callback(executor.shutdown)
     executor.add_node(node)
     return node, executor
+
+
+def watch_shutdown(resources):
+    requested = False
+
+    def request_stop(_signum, _frame):
+        nonlocal requested
+        requested = True
+
+    # 在循环边界关闭 ROS 上下文，避免信号打断 Humble 的消息转换。
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.signal(signum, request_stop)
+        resources.callback(signal.signal, signum, previous)
+    return lambda: requested

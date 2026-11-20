@@ -3,8 +3,10 @@
 import fcntl
 import json
 import shutil
+import signal
 import subprocess
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -79,3 +81,17 @@ def test_acceptance_rejects_simultaneous_runs_with_one_shared_domain(
     assert not report["通过"]
     assert report["失败原因"] == "ROS 域 74 已有双车验收在运行"
     assert not (output / "duel_sim.log").exists()
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_dual_domain_shutdown_waits_for_executor_loop(signum):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_duel.ros_domains import watch_shutdown
+
+    previous = signal.getsignal(signum)
+    with ExitStack() as resources:
+        requested = watch_shutdown(resources)
+        assert not requested()
+        signal.raise_signal(signum)
+        assert requested()
+    assert signal.getsignal(signum) == previous

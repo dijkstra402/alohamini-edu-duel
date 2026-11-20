@@ -31,7 +31,7 @@ export CYCLONEDDS_URI="$(cat "$(ros2 pkg prefix alohamini_duel)/share/alohamini_
 ros2 topic echo /duel/scoreboard
 ```
 
-Humble 下退出前依次在两个仿真域执行 `ros2 run alohamini_navigation map_session stop --runtime-mode simulation`，让碰撞监测先结束生命周期再关闭启动进程。
+Humble 下退出前依次在两个仿真域执行 `ros2 run alohamini_navigation map_session stop --runtime-mode simulation`，让碰撞监测先结束生命周期再关闭启动进程。裁判和共享世界收到停止信号后退出消息循环，再关闭各自的 ROS 上下文。
 
 双车实机底盘联调可分别加 `referee_status:=true`，令独立裁判读取定位和联机状态。裁判机需能通过 DDS 发现两个域。在该机器上加载同一份标定与地图后运行 `ros2 run alohamini_duel duel_referee --arena 场地标定.yaml --map map.yaml --domains 5 6`。这个进程的输出为软件比分。
 

@@ -125,11 +125,12 @@ def main(args=None):
     from rclpy.node import Node
     from std_msgs.msg import String
 
-    from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
+    from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args, watch_shutdown
 
     arguments = parse_dual_domain_args(dual_domain_parser(__doc__, (5, 6)), args)
     referee = Referee(Arena.load(arguments.arena, arguments.map))
     with ExitStack() as resources:
+        shutdown_requested = watch_shutdown(resources)
         nodes, executors, publishers = [], [], []
         for robot_id, domain in zip(ROBOT_IDS, arguments.domains, strict=True):
             node, executor = attach_domain(
@@ -156,7 +157,7 @@ def main(args=None):
         last_scoreboard = ""
         next_publish = 0.0
         try:
-            while all(node.context.ok() for node in nodes):
+            while not shutdown_requested() and all(node.context.ok() for node in nodes):
                 for executor in executors:
                     executor.spin_once(timeout_sec=0.01)
                 now = time.monotonic()
