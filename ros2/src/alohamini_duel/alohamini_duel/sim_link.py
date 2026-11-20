@@ -10,19 +10,24 @@ from threading import Event, Lock, Thread
 from .peer_sync import MAX_PACKET_BYTES
 
 DELAY_S = 0.75
+VEHICLE_PORT_BASE = 5600
 
 
-def loopback_socket(resources):
+def loopback_socket(resources, port=0):
     endpoint = resources.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
-    endpoint.bind(("127.0.0.1", 0))
+    endpoint.bind(("127.0.0.1", port))
     return endpoint
 
 
 class SimulationLink:
-    def __init__(self, resources):
-        self.endpoints = tuple(loopback_socket(resources) for _ in range(2))
+    def __init__(self, resources, domains):
+        # 车辆启动前会释放检测套接字。选择 DDS 和系统临时端口范围之外的端口。
         with ExitStack() as reservation:
-            self.vehicles = tuple(loopback_socket(reservation).getsockname() for _ in range(2))
+            self.vehicles = tuple(
+                loopback_socket(reservation, VEHICLE_PORT_BASE + domain).getsockname()
+                for domain in domains
+            )
+            self.endpoints = tuple(loopback_socket(resources) for _ in domains)
         self.lock = Lock()
         self.pending = deque()
         self.mode = "normal"

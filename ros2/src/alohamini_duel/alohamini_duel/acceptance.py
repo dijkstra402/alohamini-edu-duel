@@ -16,6 +16,7 @@ import yaml
 
 from .arena import ROBOT_IDS
 from .calibrate import calibrate
+from .fault_event import STOP_DEADLINE_S, FaultEvent, recorder_boot_id
 from .route import load_route
 from .sim_evidence import GroundStop, RoundTrace
 from .sim_link import DELAY_S, SimulationLink
@@ -172,7 +173,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
                 f"ROS 域 {domain} 已有其他节点，需选用空闲域",
             )
 
-        link = SimulationLink(resources)
+        link = SimulationLink(resources, domains)
         port_a, port_b = (endpoint[1] for endpoint in link.vehicles)
         peer_a, peer_b = link.ports
         log = resources.enter_context((output / "duel_sim.log").open("w", encoding="utf-8"))
@@ -456,11 +457,11 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             lost = {robot: evidence.link_lost_s for robot, evidence in active_stops.items()}
             active_stops.clear()
             maximum = max(elapsed.values())
-            if maximum > 0.5:
+            if maximum > STOP_DEADLINE_S:
                 missed_deadlines.append(f"{scenario} {maximum:.3f} 秒")
             return {
                 "双车检测断联_s": lost, "双车停稳_s": elapsed, "双车停稳确认_s": confirmed,
-                "最迟停稳_s": maximum, "0.5秒内停稳": maximum <= 0.5,
+                "最迟停稳_s": maximum, "0.5秒内停稳": maximum <= STOP_DEADLINE_S,
             }
 
         def referee_paused():
@@ -474,10 +475,14 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
 
         watch_path = output / "stop_watch.log"
         watch_report = output / "stop_watch.json"
+        fault_marker = output / "stop_watch_event.json"
         watch_log = resources.enter_context(watch_path.open("w", encoding="utf-8"))
         watch_stdout = resources.enter_context(watch_report.open("w", encoding="utf-8"))
         watcher = subprocess.Popen(
-            command("duel_stop_watch", *domain_args, "--duration", "15"),
+            command(
+                "duel_stop_watch", *domain_args, "--duration", "15",
+                "--fault-event", str(fault_marker),
+            ),
             stdout=watch_stdout, stderr=watch_log, start_new_session=True,
         )
         resources.callback(stop_process, watcher)
@@ -514,7 +519,9 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
                 lambda: moving() and time.monotonic() - moving_at >= 0.25,
                 2, "故障注入前仿真车未保持运动", drive,
             )
-        start_timing(link.set_mode("cut"))
+        injected_ns = link.set_mode("cut")
+        start_timing(injected_ns)
+        FaultEvent(injected_ns, "仿真 UDP 转发器双向断开").write(fault_marker, recorder_boot_id())
         wait_for(
             lambda: both_offline() and referee_paused() and stopped_with_evidence(),
             4, "断联后底盘或裁判未停", drive,
@@ -529,18 +536,26 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         wait_for(sustained_stop, 2, "持续速度输入下未保持停车", drive)
         wait_for(lambda: watcher.poll() is not None, 16, "断联停车记录器未结束", drive)
         recorded = watch_report.read_text(encoding="utf-8")
-        require(watcher.returncode == 0, recorded + watch_path.read_text(encoding="utf-8"))
-        evidence = json.loads(recorded)
+        require(watcher.returncode in (0, 1), recorded + watch_path.read_text(encoding="utf-8"))
+        # Humble 的 ros2 run 在子命令退出失败后会附加一行退出说明。
+        evidence, _ = json.JSONDecoder().raw_decode(recorded)
+        results["断联停稳"] = evidence
         require(
             evidence["记录完整"] and evidence["双车"]["sword_a"]["断联前轮速显示运动"],
             "缺少断联停车证据",
         )
+        require(
+            evidence.get("故障标记", {}).get("单调时间_ns") == injected_ns
+            and evidence.get("0.5秒内停稳") is not None,
+            evidence.get("失败原因", "带故障标记的轮速记录不完整"),
+        )
+        if not evidence["0.5秒内停稳"]:
+            missed_deadlines.append(f"轮速停稳 {evidence['最迟轮速停稳_s']:.3f} 秒")
         for car in evidence["双车"].values():
             require(
                 car["检测断联_s"] > 0 and car["检测到零速_s"] >= 0 and car["检测到停稳_s"] > 0,
                 "断联时间或停稳时间无效",
             )
-        results["断联停稳"] = evidence
         if nav_goal is not None:
             require(
                 nav_goal.wait(timeout=8) == 1

@@ -51,6 +51,14 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     checks = report["检查"]
     assert checks["只读预检与速度冲突检测"]
     assert checks["断联停稳"]["记录完整"]
+    marked = checks["断联停稳"]
+    assert marked["通过"] and marked["0.5秒内停稳"]
+    assert marked["故障标记"]["来源"] == "仿真 UDP 转发器双向断开"
+    marker = json.loads((output / "stop_watch_event.json").read_text(encoding="utf-8"))
+    assert marked["故障标记"]["单调时间_ns"] == marker["triggered_ns"]
+    for observed in marked["双车"].values():
+        assert 0 <= observed["故障到轮速停稳_s"] <= 0.5
+        assert observed["故障到停稳确认_s"] >= observed["故障到轮速停稳_s"]
     timed = checks["故障注入到停稳"]
     assert set(timed["双车停稳_s"]) == {"sword_a", "shield_b"}
     assert timed["最迟停稳_s"] == max(timed["双车停稳_s"].values())

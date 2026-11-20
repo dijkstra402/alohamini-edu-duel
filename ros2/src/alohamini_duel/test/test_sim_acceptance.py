@@ -46,7 +46,8 @@ def test_round_trace_pairs_domains_and_detects_crossing_between_samples(tmp_path
 
 def test_loopback_relay_applies_loss_delay_and_restores_delivery():
     with ExitStack() as resources:
-        link = SimulationLink(resources)
+        link = SimulationLink(resources, (91, 92))
+        assert tuple(address[1] for address in link.vehicles) == (5691, 5692)
         peers = []
         for address, port in zip(link.vehicles, link.ports, strict=True):
             endpoint = resources.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
