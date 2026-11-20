@@ -9,6 +9,7 @@ from alohamini.schema import BodyVelocity
 from alohamini_duel.arena import BASE_RADIUS, ROBOT_IDS, Arena
 from alohamini_duel.cmd_vel_arbiter import MAX_SPEED, STOP, VelocityArbiter
 from alohamini_duel.peer_sync import PeerLink, PeerState, open_peer_socket
+from alohamini_duel.route import load_route
 from alohamini_duel.status import VehicleStatus
 
 POSE_A = (1.45, 1.4, 0.0)
@@ -75,6 +76,16 @@ def test_vehicle_status_distinguishes_motion_permission_and_validates_identity(a
         {"online": True, "pose": None},
     ):
         assert VehicleStatus.decode(json.dumps(frame | invalid), ROBOT_IDS[0], arena) is None
+
+
+def test_fixed_route_loads_map_poses_and_rejects_outside_footprints(arena, tmp_path):
+    example = Path(__file__).parents[1] / "config/route_example.yaml"
+    assert load_route(example, arena)[0] == pytest.approx((0.9, 0.9, math.pi / 4))
+    route = tmp_path / "route.yaml"
+    for invalid in ("- [0.05, 0.05, 0.0]", "- [0.75, 1.85, 0.0]", "- [1.5, 1.5, 9.0]"):
+        route.write_text(invalid)
+        with pytest.raises(ValueError, match="不满足场地净空或朝向范围"):
+            load_route(route, arena)
 
 
 def test_udp_clock_origin_order_restart_and_old_session(arena):

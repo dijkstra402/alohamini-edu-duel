@@ -28,6 +28,7 @@ setup(
             "duel_referee = alohamini_duel.referee_node:main",
             "duel_check = alohamini_duel.preflight:main",
             "duel_stop_watch = alohamini_duel.stop_watch:main",
+            "duel_route = alohamini_duel.route:main",
         ]
     },
 )

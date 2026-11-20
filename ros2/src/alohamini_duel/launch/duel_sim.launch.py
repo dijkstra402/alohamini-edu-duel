@@ -56,6 +56,7 @@ def _nodes(context):
                 f"robot_id:={robot_id}", f"arena:={arena}", f"map:={map_file}",
                 "bind_ip:=127.0.0.1", f"bind_port:={ports[index]}",
                 "peer_ip:=127.0.0.1", f"peer_port:={ports[1 - index]}",
+                f"use_nav2:={value('use_nav2')}",
                 f"use_rviz:={value('use_rviz')}",
             ],
             name=f"duel_{robot_id}",
@@ -89,6 +90,7 @@ def generate_launch_description():
         "port_a": "5588",
         "port_b": "5589",
         "use_rviz": "false",
+        "use_nav2": "false",
     }
     return LaunchDescription(
         [

@@ -42,6 +42,49 @@ def configured_file(path, kind, overrides=None):
     return str(output), RegisterEventHandler(OnShutdown(on_shutdown=cleanup))
 
 
+def navigation_nodes(parameters, use_sim_time, *, cmd_vel_out="cmd_vel", waypoint_follower=True):
+    """组合导航组件，通过指定话题输出平滑速度。"""
+    components = [
+        ("nav2_controller", "controller_server", [("cmd_vel", "cmd_vel_nav")]),
+        ("nav2_smoother", "smoother_server", []),
+        ("nav2_planner", "planner_server", []),
+        ("nav2_behaviors", "behavior_server", [("cmd_vel", "cmd_vel_nav")]),
+        ("nav2_bt_navigator", "bt_navigator", []),
+        *([("nav2_waypoint_follower", "waypoint_follower", [])] if waypoint_follower else []),
+        (
+            "nav2_velocity_smoother",
+            "velocity_smoother",
+            [("cmd_vel", "cmd_vel_nav"), ("cmd_vel_smoothed", cmd_vel_out)],
+        ),
+    ]
+    return [
+        *[
+            Node(
+                package=package,
+                executable=name,
+                name=name,
+                output="screen",
+                parameters=[parameters, {"use_sim_time": use_sim_time}],
+                remappings=remappings,
+            )
+            for package, name, remappings in components
+        ],
+        Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_navigation",
+            output="screen",
+            parameters=[
+                {
+                    "autostart": True,
+                    "node_names": [name for _, name, _ in components],
+                    "use_sim_time": use_sim_time,
+                }
+            ],
+        ),
+    ]
+
+
 def ekf_parameters(use_imu, use_sim_time=False):
     # Input order: xyz, rpy, vxyz, vrpy, axyz. Do not fuse an integrated wheel
     # pose a second time or use gravity-containing acceleration as planar motion.

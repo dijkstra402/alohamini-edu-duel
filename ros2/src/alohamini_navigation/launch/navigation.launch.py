@@ -2,7 +2,13 @@
 
 from pathlib import Path
 
-from alohamini_navigation.launching import configured_file, include, model_config, runtime_defaults
+from alohamini_navigation.launching import (
+    configured_file,
+    include,
+    model_config,
+    navigation_nodes,
+    runtime_defaults,
+)
 from alohamini_navigation.maps import validate_map_revision
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -24,19 +30,6 @@ def _nodes(context):
     )
     simulation = value("use_sim_time") == "true"
     configured = ParameterFile(params, allow_substs=True)
-    components = [
-        ("nav2_controller", "controller_server", [("cmd_vel", "cmd_vel_nav")]),
-        ("nav2_smoother", "smoother_server", []),
-        ("nav2_planner", "planner_server", []),
-        ("nav2_behaviors", "behavior_server", [("cmd_vel", "cmd_vel_nav")]),
-        ("nav2_bt_navigator", "bt_navigator", []),
-        ("nav2_waypoint_follower", "waypoint_follower", []),
-        (
-            "nav2_velocity_smoother",
-            "velocity_smoother",
-            [("cmd_vel", "cmd_vel_nav"), ("cmd_vel_smoothed", "cmd_vel")],
-        ),
-    ]
     return [
         cleanup,
         include("alohamini_navigation", "runtime.launch.py"),
@@ -67,30 +60,7 @@ def _nodes(context):
                 }
             ],
         ),
-        *[
-            Node(
-                package=package,
-                executable=name,
-                name=name,
-                output="screen",
-                parameters=[configured, {"use_sim_time": simulation}],
-                remappings=remappings,
-            )
-            for package, name, remappings in components
-        ],
-        Node(
-            package="nav2_lifecycle_manager",
-            executable="lifecycle_manager",
-            name="lifecycle_manager_navigation",
-            output="screen",
-            parameters=[
-                {
-                    "autostart": True,
-                    "node_names": [name for _, name, _ in components],
-                    "use_sim_time": simulation,
-                }
-            ],
-        ),
+        *navigation_nodes(configured, simulation),
     ]
 
 

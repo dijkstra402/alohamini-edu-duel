@@ -48,3 +48,17 @@ ros2 run alohamini_duel duel_stop_watch --arena 场地标定.yaml --map map.yaml
 时间来自记录机接收 ROS 消息的单调时钟，测量起点是记录到联机下降沿的时刻。实际断线到触发检测的耗时、车体滑行距离和物理停稳仍由现场验收测量。
 
 Humble 双域端到端测试通过实际 UDP 故障注入取得双车停稳记录，相关回归共 45 项通过。
+
+## 固定航点导航
+
+双车启动时可传 `use_nav2:=true`。固定航点任务使用框架的规划器、控制器、速度平滑器和 `NavigateThroughPoses`。平滑器输出重映射到 `/cmd_vel_nav_out`，由双车仲裁器统一输出 `/cmd_vel`，再经过碰撞监测。纯定位启动仍使用默认配置。框架独立的单车导航入口仍提供 `FollowWaypoints`。
+
+`duel_route` 读取按顺序排列的 `[x, y, yaw]` 列表，坐标属于共用 `map`，朝向为弧度。每个目标都检查场地与箱体净空。软件裁判状态和个人路线可以并行运行，路线目标来自配置文件。
+
+```bash
+ros2 run alohamini_duel duel_route --robot-id sword_a --arena 场地标定.yaml --map map.yaml --route 航点.yaml
+```
+
+在相应车辆的 ROS 域运行。实机启动时启用 `referee_status:=true`，按现场流程操作 Bridge 和速度仲裁的使能。命令等待定位、双向心跳、已使能仲裁及 Nav2 就绪，开始后在联机状态失效或中断时撤销自己的目标。仿真运行时加 `--simulation`，示例航点位于包的 `config/route_example.yaml`。
+
+Humble 隔离仿真验收到达固定航点、断联取消及重连后保持静止。完整回归共 48 项通过。

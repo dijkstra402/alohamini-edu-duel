@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 
-def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
+@pytest.mark.parametrize("use_nav2", [False, True])
+def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch, use_nav2):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     from ament_index_python.packages import PackageNotFoundError, get_package_prefix
     from geometry_msgs.msg import Twist
@@ -28,6 +29,8 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
 
     try:
         get_package_prefix("alohamini_duel")
+        if use_nav2:
+            get_package_prefix("nav2_bt_navigator")
     except PackageNotFoundError:
         pytest.skip("需要已构建并加载的 alohamini_duel")
     if not shutil.which("ros2"):
@@ -52,6 +55,7 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
                 "ros2", "launch", "alohamini_duel", "duel_sim.launch.py",
                 f"domain_a:={domains[0]}", f"domain_b:={domains[1]}",
                 f"port_a:={port_a}", f"port_b:={port_b}",
+                f"use_nav2:={str(use_nav2).lower()}",
             ],
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -158,6 +162,27 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
 
         switch_service("/alohamini_nav_sim/command_enable", True)
         switch_service("/alohamini_duel_base/command_enable", True)
+        route_command = [
+            "ros2", "run", "alohamini_duel", "duel_route", "--simulation",
+            "--arena", str(config / "arena_example.yaml"),
+            "--map", str(config / "duel_arena_map.yaml"),
+            "--robot-id", "sword_a", "--timeout", "35",
+        ]
+        route_env = os.environ | {"ROS_DOMAIN_ID": str(domains[0])}
+        if use_nav2:
+            reached = subprocess.run(
+                [*route_command, "--route", str(config / "route_example.yaml")],
+                env=route_env, capture_output=True, text=True, timeout=40, check=False,
+            )
+            assert reached.returncode == 0, (
+                reached.stdout + reached.stderr + log_path.read_text()[-8000:]
+            )
+            wait_for(
+                lambda: telemetry[(domains[0], "/simulation/ground_truth")].pose.pose.position.x
+                > 0.96,
+                2,
+                "仿真车未实际驶入最后一个固定航点的邻域",
+            )
         publisher = nodes[0].create_publisher(Twist, "/cmd_vel_duel", 1)
         command = Twist()
         command.linear.x = 0.10
@@ -195,9 +220,33 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
             lambda: "等待断联事件" in watch_log_path.read_text(),
             5,
             "断联记录未收到双车输入",
-            drive,
+            drive if not use_nav2 else None,
         )
-        wait_for(lambda: measured_speed() > 0.05, 8, "仿真车未收到底盘速度", drive)
+        route_process = None
+        if use_nav2:
+            wait_for(lambda: abs(measured_speed()) < 0.01, 3, "首条路线结束后未停稳")
+            long_route = tmp_path / "long_route.yaml"
+            long_route.write_text("- [1.48, 1.48, 0.7853981634]\n")
+            route_log_path = tmp_path / "route.log"
+            route_log = cleanup.enter_context(route_log_path.open("w"))
+            route_process = subprocess.Popen(
+                [*route_command, "--route", str(long_route)],
+                env=route_env, stdout=route_log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+
+            def stop_route_process():
+                if route_process.poll() is None:
+                    os.killpg(route_process.pid, signal.SIGKILL)
+                    route_process.wait(timeout=5)
+
+            cleanup.callback(stop_route_process)
+            wait_for(
+                lambda: "固定航点导航已启动" in route_log_path.read_text(), 5, "第二条路线未启动"
+            )
+        wait_for(
+            lambda: measured_speed() > 0.05, 8, "仿真车未收到底盘速度",
+            drive if not use_nav2 else None,
+        )
         switch_service("/alohamini_duel_base/peer_link_enable", False)
         wait_for(
             lambda: all(not telemetry[(domain, "/duel/peer_online")].data for domain in domains)
@@ -221,9 +270,15 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
             assert vehicle["检测断联_s"] > 0
             assert vehicle["检测到零速_s"] >= 0
             assert vehicle["检测到停稳_s"] > 0
+        if route_process is not None:
+            assert route_process.wait(timeout=8) == 1, route_log_path.read_text()
+            assert "Nav2 已取消固定航点任务" in route_log_path.read_text()
         assert telemetry[(domains[0], "/scan")].ranges[0] < 2.5
         switch_service("/alohamini_duel_base/peer_link_enable", True)
         wait_for(lambda: both_online() and ready(), 8, "恢复后双车未重新进入联机状态")
+        if use_nav2:
+            stopped_at = time.monotonic()
+            wait_for(stopped_under_command, 2, "重连后已取消的航点任务恢复运动")
 
         def scoreboard(domain):
             return json.loads(telemetry[(domain, "/duel/scoreboard")].data)

@@ -7,10 +7,10 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    ("simulation", "referee_status"),
-    [(False, None), (False, "true"), (True, None)],
+    ("simulation", "referee_status", "use_nav2"),
+    [(False, None, False), (False, "true", False), (True, None, False), (True, None, True)],
 )
-def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_status):
+def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_status, use_nav2):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     spec = importlib.util.spec_from_file_location(
         "duel_launch_graph",
@@ -22,6 +22,7 @@ def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_statu
     map_file.write_text("image: map.pgm\nresolution: 0.05\norigin: [0, 0, 0]\n")
     (tmp_path / "map.pgm").write_bytes(b"P5\n1 1\n255\n\0")
     launch_options = {"referee_status": referee_status} if referee_status is not None else {}
+    details = []
     nodes, processes = helpers.launch_graph(
         "alohamini_duel",
         "duel_vehicle_sim.launch.py" if simulation else "duel_hw.launch.py",
@@ -30,14 +31,30 @@ def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_statu
         host="192.0.2.10",
         peer_ip="192.0.2.20",
         robot_id="shield_b",
+        use_nav2=str(use_nav2).lower(),
+        details=details,
         **launch_options,
     )
     assert not processes
     packages = [package for package, _, _ in nodes]
     for package in ("nav2_collision_monitor", "nav2_amcl", "alohamini_duel"):
         assert packages.count(package) == 1
-    assert "nav2_controller" not in packages
-    assert "nav2_velocity_smoother" not in packages
+    assert ("nav2_controller" in packages) is use_nav2
+    assert ("nav2_velocity_smoother" in packages) is use_nav2
+    assert "nav2_waypoint_follower" not in packages
+    if use_nav2:
+        smoother = next(item for item in details if item["package"] == "nav2_velocity_smoother")
+        assert smoother["remappings"]["cmd_vel_smoothed"] == "/cmd_vel_nav_out"
+        standalone_details = []
+        standalone, _ = helpers.launch_graph(
+            "alohamini_navigation", "navigation.launch.py",
+            map=str(map_file), details=standalone_details,
+        )
+        assert any(package == "nav2_waypoint_follower" for package, _, _ in standalone)
+        standalone_smoother = next(
+            item for item in standalone_details if item["package"] == "nav2_velocity_smoother"
+        )
+        assert standalone_smoother["remappings"]["cmd_vel_smoothed"] == "cmd_vel"
     by_executable = {executable: params for _, executable, params in nodes}
     if simulation:
         assert "alohamini_bridge" not in packages

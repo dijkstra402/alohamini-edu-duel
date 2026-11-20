@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from alohamini_navigation.launching import configured_file, include, model_config
+from alohamini_navigation.launching import configured_file, include, model_config, navigation_nodes
 from alohamini_navigation.maps import validate_map_revision
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -32,6 +32,7 @@ def _nodes(context, *, simulation):
     params, cleanup = configured_file(model_config("alohamini2edu", "nav2"), "nav2")
     configured = ParameterFile(params, allow_substs=True)
     sim_time = {"use_sim_time": simulation}
+    nav_enabled = value("use_nav2").lower() == "true"
     return [
         cleanup,
         include(
@@ -94,6 +95,14 @@ def _nodes(context, *, simulation):
             ],
             output="screen",
         ),
+        *(
+            navigation_nodes(
+                configured, simulation, cmd_vel_out="/cmd_vel_nav_out",
+                waypoint_follower=False,
+            )
+            if nav_enabled
+            else []
+        ),
     ]
 
 
@@ -115,6 +124,7 @@ def vehicle_launch(*, simulation):
             DeclareLaunchArgument("peer_port", default_value="5588"),
             DeclareLaunchArgument("start_sensors", default_value="false"),
             DeclareLaunchArgument("referee_status", default_value=str(simulation).lower()),
+            DeclareLaunchArgument("use_nav2", default_value="false"),
             DeclareLaunchArgument("use_rviz", default_value="false"),
             OpaqueFunction(function=_nodes, kwargs={"simulation": simulation}),
         ]
