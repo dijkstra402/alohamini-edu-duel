@@ -7,6 +7,17 @@ from dataclasses import dataclass
 from .arena import Arena, Pose, coordinates
 
 
+def fresh_stamp(header, frame, now_ns, max_age):
+    stamp_ns = header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
+    if header.frame_id == frame and stamp_ns > 0 and -0.05 <= (now_ns - stamp_ns) / 1e9 <= max_age:
+        return stamp_ns
+    return None
+
+
+def wheel_is_stationary(twist):
+    return math.hypot(twist.linear.x, twist.linear.y) < 0.01 and abs(twist.angular.z) < 0.03
+
+
 @dataclass(frozen=True)
 class VehicleStatus:
     session_id: str

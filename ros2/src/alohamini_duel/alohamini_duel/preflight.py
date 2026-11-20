@@ -18,7 +18,7 @@ from std_msgs.msg import String
 
 from .arena import BASE_RADIUS, ROBOT_IDS, Arena
 from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
-from .status import VehicleStatus
+from .status import VehicleStatus, fresh_stamp, wheel_is_stationary
 
 BRIDGE = "alohamini_lerobot_bridge"
 ARBITER = "alohamini_duel_base"
@@ -67,9 +67,7 @@ class VehicleCheck(Node):
         return samples >= count and time.monotonic() - received <= max_age
 
     def current_stamp(self, header, frame, max_age=0.5):
-        stamp_ns = header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
-        age = (self.get_clock().now().nanoseconds - stamp_ns) / 1e9
-        return header.frame_id == frame and stamp_ns > 0 and -0.05 <= age <= max_age
+        return fresh_stamp(header, frame, self.get_clock().now().nanoseconds, max_age) is not None
 
     def on_status(self, message):
         status = VehicleStatus.decode(message.data, self.robot_id, self.arena)
@@ -104,8 +102,7 @@ class VehicleCheck(Node):
     def on_wheel(self, message):
         speed = message.twist.twist
         valid = self.current_stamp(message.header, "base_link", max_age=0.25)
-        stationary = math.hypot(speed.linear.x, speed.linear.y) < 0.01
-        self.record("底盘反馈静止", valid and stationary and abs(speed.angular.z) < 0.03)
+        self.record("底盘反馈静止", valid and wheel_is_stationary(speed))
 
     def on_safe_velocity(self, message):
         # 碰撞监测超过 stop_pub_timeout 后可以停止重复发送零速。

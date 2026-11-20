@@ -168,6 +168,35 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
         def measured_speed():
             return telemetry[(domains[0], "/simulation/ground_truth")].twist.twist.linear.x
 
+        watch_log_path = tmp_path / "stop_watch.log"
+        watch_log = cleanup.enter_context(watch_log_path.open("w"))
+        observer = subprocess.Popen(
+            [
+                "ros2", "run", "alohamini_duel", "duel_stop_watch", "--simulation",
+                "--arena", str(config / "arena_example.yaml"),
+                "--map", str(config / "duel_arena_map.yaml"),
+                "--domains", *(str(domain) for domain in domains),
+                "--duration", "12",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=watch_log,
+            text=True,
+            start_new_session=True,
+        )
+
+        def stop_observer():
+            if observer.poll() is None:
+                os.killpg(observer.pid, signal.SIGKILL)
+                observer.wait(timeout=5)
+            observer.stdout.close()
+
+        cleanup.callback(stop_observer)
+        wait_for(
+            lambda: "等待断联事件" in watch_log_path.read_text(),
+            5,
+            "断联记录未收到双车输入",
+            drive,
+        )
         wait_for(lambda: measured_speed() > 0.05, 8, "仿真车未收到底盘速度", drive)
         switch_service("/alohamini_duel_base/peer_link_enable", False)
         wait_for(
@@ -184,6 +213,14 @@ def test_full_simulation_fault_and_recovery(tmp_path, monkeypatch):
             return time.monotonic() - stopped_at > 0.25
 
         wait_for(stopped_under_command, 2, "持续输入速度时停车状态丢失", drive)
+        recorded, _ = observer.communicate(timeout=5)
+        assert observer.returncode == 0, recorded + watch_log_path.read_text()
+        evidence = json.loads(recorded)
+        assert evidence["记录完整"] and evidence["双车"]["sword_a"]["断联前轮速显示运动"]
+        for vehicle in evidence["双车"].values():
+            assert vehicle["检测断联_s"] > 0
+            assert vehicle["检测到零速_s"] >= 0
+            assert vehicle["检测到停稳_s"] > 0
         assert telemetry[(domains[0], "/scan")].ranges[0] < 2.5
         switch_service("/alohamini_duel_base/peer_link_enable", True)
         wait_for(lambda: both_online() and ready(), 8, "恢复后双车未重新进入联机状态")
