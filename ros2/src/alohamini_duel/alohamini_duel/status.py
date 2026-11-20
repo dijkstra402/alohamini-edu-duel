@@ -18,6 +18,10 @@ def wheel_is_stationary(twist):
     return math.hypot(twist.linear.x, twist.linear.y) < 0.01 and abs(twist.angular.z) < 0.03
 
 
+def yaw_from_quaternion(q):
+    return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+
+
 @dataclass(frozen=True)
 class VehicleStatus:
     session_id: str

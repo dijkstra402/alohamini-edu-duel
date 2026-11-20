@@ -29,6 +29,9 @@ setup(
             "duel_check = alohamini_duel.preflight:main",
             "duel_stop_watch = alohamini_duel.stop_watch:main",
             "duel_route = alohamini_duel.route:main",
+            "duel_calibrate = alohamini_duel.calibrate:main",
+            "duel_radar = alohamini_duel.radar:main",
+            "duel_accept_sim = alohamini_duel.acceptance:main",
         ]
     },
 )

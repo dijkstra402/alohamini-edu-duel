@@ -57,6 +57,7 @@ def _nodes(context):
                 "bind_ip:=127.0.0.1", f"bind_port:={ports[index]}",
                 "peer_ip:=127.0.0.1", f"peer_port:={ports[1 - index]}",
                 f"use_nav2:={value('use_nav2')}",
+                f"radar_diagnostics:={value('radar_diagnostics')}",
                 f"use_rviz:={value('use_rviz')}",
             ],
             name=f"duel_{robot_id}",
@@ -91,6 +92,7 @@ def generate_launch_description():
         "port_b": "5589",
         "use_rviz": "false",
         "use_nav2": "false",
+        "radar_diagnostics": "false",
     }
     return LaunchDescription(
         [

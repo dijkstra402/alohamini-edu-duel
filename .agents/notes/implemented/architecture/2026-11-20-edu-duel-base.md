@@ -25,6 +25,16 @@ Status: implemented
 
 共享仿真与记分规则见 [双车共享仿真](2026-11-20-edu-duel-simulation.md)。
 
+## 场地标定
+
+按包内 `config/measurements_example.yaml` 记录测点。墙角从选定的场地原点开始逆时针填写，第一段确定场地横轴。箱角按逆时针填写。两车起点为共用地图中的 `[x, y, yaw]`，单位为米和弧度。
+
+```bash
+ros2 run alohamini_duel duel_calibrate --measurements 测点.yaml --map map.yaml --output 场地标定.yaml
+```
+
+命令按矩形拟合墙角，用场地坐标下的外接矩形包住每个箱体，默认接受 0.03 米拟合误差。检查墙边、箱体和双车起点间的名义净空，通过后才写入新文件并打印场地指纹。可用 `--tolerance` 设置测点容差。地图 YAML 和图像共同参与指纹计算，管理地图还会校验版本清单。
+
 ## 实机只读预检
 
 两车机械臂收拢，分别停在标定点。使用同一份地图和场地标定，在两车的 `duel_hw.launch.py` 加上 `referee_status:=true`。预检机须能通过 DDS 读取两车各自的域。

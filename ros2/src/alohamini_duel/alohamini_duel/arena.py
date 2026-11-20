@@ -24,6 +24,12 @@ def coordinates(values, length, name):
     return tuple(values)
 
 
+def local_point(origin: Pose, point: Point) -> Point:
+    dx, dy = point[0] - origin[0], point[1] - origin[1]
+    c, s = math.cos(origin[2]), math.sin(origin[2])
+    return dx * c + dy * s, -dx * s + dy * c
+
+
 def segment_distance(start: Point, end: Point, point: Point) -> float:
     dx, dy = end[0] - start[0], end[1] - start[1]
     px, py = point[0] - start[0], point[1] - start[1]
@@ -81,7 +87,11 @@ class Arena:
         }
         map_path = Path(map_file)
         map_bytes = map_path.read_bytes()
-        image_path = map_path.parent / yaml.safe_load(map_bytes)["image"]
+        map_data = yaml.safe_load(map_bytes)
+        image = map_data.get("image") if isinstance(map_data, dict) else None
+        if not isinstance(image, str) or not image:
+            raise ValueError("地图 YAML 必须指定栅格图像")
+        image_path = map_path.parent / image
         digest = hashlib.sha256()
         for content in (arena_bytes, map_bytes, image_path.read_bytes()):
             digest.update(hashlib.sha256(content).digest())
@@ -94,9 +104,7 @@ class Arena:
         return arena
 
     def local(self, point: Point) -> Point:
-        dx, dy = point[0] - self.origin[0], point[1] - self.origin[1]
-        c, s = math.cos(self.origin[2]), math.sin(self.origin[2])
-        return dx * c + dy * s, -dx * s + dy * c
+        return local_point(self.origin, point)
 
     def contains(self, point: Point) -> bool:
         x, y = self.local(point)

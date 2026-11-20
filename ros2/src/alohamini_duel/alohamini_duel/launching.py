@@ -103,6 +103,18 @@ def _nodes(context, *, simulation):
             if nav_enabled
             else []
         ),
+        *(
+            [
+                Node(
+                    package="alohamini_duel",
+                    executable="duel_radar",
+                    parameters=[sim_time],
+                    output="screen",
+                )
+            ]
+            if value("radar_diagnostics").lower() == "true"
+            else []
+        ),
     ]
 
 
@@ -125,6 +137,7 @@ def vehicle_launch(*, simulation):
             DeclareLaunchArgument("start_sensors", default_value="false"),
             DeclareLaunchArgument("referee_status", default_value=str(simulation).lower()),
             DeclareLaunchArgument("use_nav2", default_value="false"),
+            DeclareLaunchArgument("radar_diagnostics", default_value="false"),
             DeclareLaunchArgument("use_rviz", default_value="false"),
             OpaqueFunction(function=_nodes, kwargs={"simulation": simulation}),
         ]

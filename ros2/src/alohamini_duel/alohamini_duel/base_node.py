@@ -20,6 +20,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from .arena import ROBOT_IDS, Arena
 from .cmd_vel_arbiter import STOP, VelocityArbiter
 from .peer_sync import HEARTBEAT_PERIOD, MAX_PACKET_BYTES, PeerLink, open_peer_socket
+from .status import yaw_from_quaternion
 
 MAX_POSE_AGE = 0.35
 
@@ -112,7 +113,7 @@ class DuelBase(Node):
         if not self._fresh(transform.header, now_ns):
             return None
         point, q = transform.transform.translation, transform.transform.rotation
-        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        yaw = yaw_from_quaternion(q)
         twist = odometry.twist.twist.linear
         if not all(math.isfinite(value) for value in (point.x, point.y, yaw, twist.x, twist.y)):
             return None

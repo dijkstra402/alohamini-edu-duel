@@ -33,10 +33,27 @@ ros2 topic echo /duel/scoreboard
 
 Humble 下退出前依次在两个仿真域执行 `ros2 run alohamini_navigation map_session stop --runtime-mode simulation`，让碰撞监测先结束生命周期再关闭启动进程。
 
-在支持的 ROS 2 环境运行 `python -m pytest ros2/src/alohamini_duel/test`，其中实际管线测试启动双域仿真，检查运动、断联、停车、回波、恢复及有序停机。
-
 双车实机底盘联调可分别加 `referee_status:=true`，令独立裁判读取定位和联机状态。裁判机需能通过 DDS 发现两个域。在该机器上加载同一份标定与地图后运行 `ros2 run alohamini_duel duel_referee --arena 场地标定.yaml --map map.yaml --domains 5 6`。这个进程的输出为软件比分。
+
+## 一键仿真验收
+
+```bash
+ros2 run alohamini_duel duel_accept_sim --output ./双车仿真验收
+```
+
+命令在本机两个空闲 ROS 域启动并关闭双车仿真。环境需要 Cyclone DDS，并默认使用完整 Nav2。报告目录须为新目录，包含 `report.json`、启动日志、停车记录日志与航点取消日志。两域默认编号为 73 和 74，可用 `--domains` 指定编号。加 `--no-nav2` 可验收纯定位模式。
+
+报告记录双向上线、速度发布冲突检测、航点到达、断联停车、取消任务、雷达诊断更新、重连、电子判分与有序停机。检查失败会记录已通过的环节和失败原因，并返回失败退出码。
+
+## 雷达差分诊断
+
+启动时加 `radar_diagnostics:=true` 可在每个车辆域启用诊断。节点在扫描时间查找雷达到地图的变换，使用静态栅格过滤已知墙面和箱体、遮挡区域、未知区域及无效量程。诊断只发布两路数据。
+
+- `/duel/radar_diagnostics` 发布扫描时间和分类计数。
+- `/duel/radar_unexpected` 发布地图中的差异点，可在以 `map` 为固定坐标系的 RViz 中添加 `PointCloud` 显示。
+
+诊断默认使用 0.12 米墙面容差，可在节点启动参数中设置 `map_tolerance_m`。超出容差的定位误差也可能形成差异点。
 
 ## Testing
 
-Ubuntu 22.04 ARM64 容器使用 ROS 2 Humble、Cyclone DDS 和仓库的 TF2 修补版。构建 8 个相关包，41 项测试通过，双域仿真按生命周期顺序干净退出。真机验收继续使用现场地图、标定和停稳反馈。
+在支持的 ROS 2 环境运行 `python -m pytest ros2/src/alohamini_duel/test`。实际管线测试运行安装后的一键验收命令，覆盖纯定位及 Nav2 两种配置。差分单测覆盖墙面、临时回波、遮挡、未知地图、旋转地图和定位偏差。真机验收继续使用现场地图、标定和停稳反馈。
