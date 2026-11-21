@@ -14,11 +14,11 @@ from pathlib import Path
 
 import yaml
 
-from .arena import ROBOT_IDS
+from .arena import ROBOT_IDS, Arena
 from .calibrate import calibrate
 from .fault_event import STOP_DEADLINE_S, FaultEvent, recorder_boot_id
 from .route import load_route
-from .sim_evidence import GroundStop, RoundTrace
+from .sim_evidence import GroundStop, RoundTrace, peer_radar_hits
 from .sim_link import DELAY_S, SimulationLink
 from .sim_round import prepare_round
 from .status import wheel_is_stationary, yaw_from_quaternion
@@ -78,6 +78,8 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         arena_file = output / "acceptance_arena.yaml"
         arena = calibrate(measurements, map_file, arena_file, 0.03)
         expected_scores["shield_b"] = 1
+    else:
+        arena = Arena.load(arena_file, map_file)
     os.environ["ROS_LOCALHOST_ONLY"] = "1"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
     os.environ["ROS_LOG_DIR"] = str(output / "ros")
@@ -122,18 +124,30 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         ]
         nodes, executors = zip(*endpoints, strict=True)
         telemetry = {}
+        truth_history = {domain: {} for domain in domains}
         active_stops = {}
         radar_topic = "/duel/radar_diagnostics"
         cloud_topic = "/duel/radar_unexpected"
+        sim_state_topic = "/alohamini_nav_sim/state_json"
 
         def receive(message, domain, robot, topic):
             telemetry[(domain, topic)] = message
             if topic == "/duel/peer_online" and robot in active_stops:
                 active_stops[robot].observe_link(time.monotonic_ns(), message.data)
+            if topic == sim_state_topic and round_trace is not None:
+                counters = json.loads(message.data).get("_simulation")
+                if counters is not None:
+                    round_trace.observe_collisions(
+                        robot, counters["stamp_ns"], counters["geometry_collisions"], counters["pair_collisions"]
+                    )
             if topic != "/simulation/ground_truth":
                 return
             header = message.header.stamp
             stamp = header.sec * 10**9 + header.nanosec
+            history = truth_history[domain]
+            history[stamp] = message.pose.pose
+            if len(history) > 50:
+                del history[next(iter(history))]
             if robot in active_stops:
                 active_stops[robot].observe(
                     stamp, time.monotonic_ns(), wheel_is_stationary(message.twist.twist)
@@ -150,6 +164,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
                 (String, "/duel/scoreboard"),
                 (String, radar_topic),
                 (PointCloud, cloud_topic),
+                *(((String, sim_state_topic),) if full_round else ()),
             ):
                 node.create_subscription(
                     kind, topic,
@@ -289,20 +304,33 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         def radar_ready(domain):
             cloud = telemetry.get((domain, cloud_topic))
             summary = read_json(domain, radar_topic)
-            if cloud is None or not (full_round or cloud.points):
-                return False
+            if cloud is None or not cloud.points:
+                return 0
             stamp = cloud.header.stamp
-            return (
-                cloud.header.frame_id == "map"
-                and summary.get("stamp_ns") == stamp.sec * 10**9 + stamp.nanosec
-                and summary["unexpected"] == len(cloud.points)
+            stamp_ns = stamp.sec * 10**9 + stamp.nanosec
+            other = domains[1] if domain == domains[0] else domains[0]
+            pose = truth_history[other].get(stamp_ns)
+            if (
+                pose is None or cloud.header.frame_id != "map"
+                or summary.get("stamp_ns") != stamp_ns
+                or summary.get("unexpected") != len(cloud.points)
+            ):
+                return 0
+            return peer_radar_hits(
+                arena,
+                (pose.position.x, pose.position.y, yaw_from_quaternion(pose.orientation)),
+                ((point.x, point.y) for point in cloud.points),
+                summary.get("background", 0),
             )
 
         wait_for(
             lambda: all(radar_ready(domain) for domain in domains),
-            8, "双域未取得与雷达诊断匹配的地图坐标点云",
+            8, "双域雷达未在同一真值时刻取得静态背景和对端车体回波",
         )
-        results["雷达差分"] = {str(domain): read_json(domain, radar_topic) for domain in domains}
+        results["雷达差分"] = {
+            str(domain): read_json(domain, radar_topic) | {"对端包络命中": radar_ready(domain)}
+            for domain in domains
+        }
 
         preflight = command(
             "duel_check", *domain_args, "--duration", "2",
@@ -352,7 +380,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             )
             results["有序停机"] = True
 
-        for index in range(2 if full_round or not use_nav2 else 1):
+        for index in range(len(nodes)):
             switch("/alohamini_nav_sim/command_enable", True, index)
             switch("/alohamini_duel_base/command_enable", True, index)
         if use_nav2:
@@ -407,10 +435,19 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             )
             require(round_trace.count > 50 and round_trace.max_gap <= 0.20,
                     f"双域真值采样间隔过长 {round_trace.max_gap:.3f} 秒")
+            final_stamp = round_trace.last_stamp
+            wait_for(
+                lambda: all(
+                    round_trace.collisions.get(robot, {}).get("stamp_ns", 0) >= final_stamp
+                    for robot in ROBOT_IDS
+                ),
+                3, "双车绕箱未取得终点后的碰撞计数",
+            )
             results["双车绕箱"] = {
                 "回合": round_id, "航点": arrivals, "墙和箱体净空通过": True,
                 "最小中心距_m": round_trace.min_distance, "配对真值帧数": round_trace.count,
                 "最大采样间隔_s": round_trace.max_gap,
+                "碰撞计数": round_trace.collisions,
                 "判分定位_m_rad": {
                     robot: read_json(domain, "/duel/local_status")["pose"]
                     for robot, domain in zip(ROBOT_IDS, domains, strict=True)
@@ -440,9 +477,14 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         velocity = [node.create_publisher(Twist, "/cmd_vel_duel", 1) for node in nodes]
         move = Twist()
         move.linear.x = 0.1
+        retreat = Twist()
+        retreat.linear.x = -move.linear.x
 
         def drive():
-            for publisher in (velocity[:1] if use_nav2 else velocity):
+            if use_nav2:
+                velocity[1].publish(retreat)
+                return
+            for publisher in velocity:
                 publisher.publish(move)
 
         missed_deadlines = []
@@ -511,18 +553,25 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
                 5, "第二条路线未启动",
             )
         def moving():
+            if use_nav2:
+                return (
+                    truth(domains[0]).twist.twist.linear.x > 0.025
+                    and truth(domains[1]).twist.twist.linear.x < -0.025
+                )
             return all(
-                truth(domain).twist.twist.linear.x > (0.025 if use_nav2 else 0.05)
-                for domain in (domains[:1] if use_nav2 else domains)
+                truth(domain).twist.twist.linear.x > 0.05 for domain in domains
             )
 
-        wait_for(moving, 8, "故障注入前未观察到仿真车运动", drive if not use_nav2 else None)
-        if not use_nav2:
-            moving_at = time.monotonic()
-            wait_for(
-                lambda: moving() and time.monotonic() - moving_at >= 0.25,
-                2, "故障注入前仿真车未保持运动", drive,
-            )
+        wait_for(moving, 8, "故障注入前未观察到双车运动", drive)
+        moving_at = time.monotonic()
+        wait_for(
+            lambda: moving() and time.monotonic() - moving_at >= 0.25,
+            2, "故障注入前双车未保持运动", drive,
+        )
+        results["故障前双车纵向速度_m_s"] = {
+            robot: truth(domain).twist.twist.linear.x
+            for robot, domain in zip(ROBOT_IDS, domains, strict=True)
+        }
         injected_ns = link.set_mode("cut")
         start_timing(injected_ns)
         FaultEvent(injected_ns, "仿真 UDP 转发器双向断开").write(fault_marker, recorder_boot_id())
@@ -545,8 +594,10 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         evidence, _ = json.JSONDecoder().raw_decode(recorded)
         results["断联停稳"] = evidence
         require(
-            evidence["记录完整"] and evidence["双车"]["sword_a"]["断联前轮速显示运动"],
-            "缺少断联停车证据",
+            evidence["记录完整"] and all(
+                car["故障前轮速显示运动"] for car in evidence["双车"].values()
+            ),
+            "缺少双车故障触发前运动或停车证据",
         )
         require(
             evidence.get("故障标记", {}).get("单调时间_ns") == injected_ns

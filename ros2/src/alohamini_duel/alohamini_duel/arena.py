@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 from alohamini._validation import finite_number
+from alohamini_navigation.maps import validate_map_revision
 
 Point = tuple[float, float]
 Pose = tuple[float, float, float]
@@ -66,6 +67,8 @@ class Arena:
 
     @classmethod
     def load(cls, arena_file, map_file):
+        map_path = Path(map_file)
+        validate_map_revision(map_path, "alohamini2edu")
         arena_bytes = Path(arena_file).read_bytes()
         data = yaml.safe_load(arena_bytes)
         if not isinstance(data, dict) or data.get("schema_version") != 1:
@@ -85,7 +88,6 @@ class Arena:
             robot_id: coordinates(positions.get(robot_id), 3, f"{robot_id} 起点")
             for robot_id in ROBOT_IDS
         }
-        map_path = Path(map_file)
         map_bytes = map_path.read_bytes()
         map_data = yaml.safe_load(map_bytes)
         image = map_data.get("image") if isinstance(map_data, dict) else None

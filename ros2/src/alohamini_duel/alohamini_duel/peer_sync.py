@@ -21,6 +21,7 @@ class PeerState:
     seq: int
     pose: Pose
     received_at: float
+    confirmed_send_at: float
 
 
 class PeerLink:
@@ -106,7 +107,6 @@ class PeerLink:
             self.ack_consecutive = 0
         if previous and session == previous.session_id and seq <= previous.seq:
             return
-        self.remote = PeerState(session, seq, pose, now)
         recent_pose = previous is not None and now - previous.received_at < LINK_STOP_TIMEOUT
         self.consecutive = min(self.consecutive + 1, 3) if recent_pose else 1
         sent = self.sent_at.get(ack_seq)
@@ -122,6 +122,7 @@ class PeerLink:
                 if now - self.acked_sent_at < LINK_STOP_TIMEOUT else 1
             )
             self.ack_seq, self.acked_sent_at = ack_seq, sent
+        self.remote = PeerState(session, seq, pose, now, self.acked_sent_at)
 
     def online(self, now: float) -> PeerState | None:
         if (

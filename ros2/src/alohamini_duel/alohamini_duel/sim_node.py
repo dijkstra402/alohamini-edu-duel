@@ -37,7 +37,7 @@ def main(args=None):
                         executor.spin_once(timeout_sec=0.0)
                 commands = (node.requested_velocity() for node in nodes)
                 for node, feedback in zip(nodes, world.step(commands, STEP_PERIOD), strict=True):
-                    node.publish_frame(feedback)
+                    node.publish_frame(feedback, pair_collisions=world.pair_collisions)
                 time.sleep(max(0.0, STEP_PERIOD - (time.monotonic() - start)))
         except (KeyboardInterrupt, ExternalShutdownException):
             pass

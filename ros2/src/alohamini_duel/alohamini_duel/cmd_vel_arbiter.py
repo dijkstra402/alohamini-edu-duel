@@ -6,6 +6,7 @@ from alohamini.schema import BodyVelocity
 
 from .arena import BASE_RADIUS, Arena, Pose, segment_distance
 from .peer_sync import PeerState
+from .status import MAX_POSE_AGE
 
 MAX_SPEED = 0.12
 MAX_YAW_SPEED = 0.35
@@ -53,7 +54,8 @@ class VelocityArbiter:
         arc_margin = min(speed, MAX_SPEED) * abs(wz) * LOOKAHEAD**2 / 2
         if not self.arena.path_clear(start, end, BASE_RADIUS + arc_margin):
             return STOP
-        peer_travel = MAX_SPEED * (now - peer.received_at + LOOKAHEAD)
+        # 确认对应本机发送时间，覆盖通信和收包排队。定位采样本身还有 TF 陈旧度。
+        peer_travel = MAX_SPEED * (now - peer.confirmed_send_at + MAX_POSE_AGE + LOOKAHEAD)
         separation = 2 * BASE_RADIUS + peer_travel + arc_margin
         if segment_distance(start, end, peer.pose[:2]) <= separation:
             return STOP

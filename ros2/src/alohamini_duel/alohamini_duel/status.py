@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from .arena import Arena, Pose, coordinates
 
+MAX_POSE_AGE = 0.35
+
 
 def fresh_stamp(header, frame, now_ns, max_age):
     stamp_ns = header.stamp.sec * 1_000_000_000 + header.stamp.nanosec

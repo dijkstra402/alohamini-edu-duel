@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,20 @@ def test_shared_step_rejects_simultaneous_overlap(arena):
         assert math.hypot(a.x - b.x, a.y - b.y) > 2 * BASE_RADIUS
         assert (a.x + b.x) / 2 == pytest.approx(1.7)
     assert result == ((0.0, 0.0, 0), (0.0, 0.0, 0))
+    assert world.pair_collisions > 0
+    assert all(vehicle.geometry_collisions == 0 for vehicle in world.vehicles)
+
+
+def test_world_counts_rejected_wall_and_box_motion_without_counting_stops(arena):
+    world = SharedDuelWorld(replace(arena, obstacles=((1.46, 1.9, 1.6, 2.1),)))
+    first, _ = world.vehicles
+    world.step(((0.4, 0, 0), (0, 0, 0)), 0.1)
+    assert first.x == 1.0 and first.geometry_collisions == 1
+    first.x, first.y = 0.46, 0.55
+    world.step(((-0.4, 0, 0), (0, 0, 0)), 0.1)
+    assert first.x == 0.46 and first.geometry_collisions == 2
+    world.step(((0, 0, 0), (0, 0, 0)), 0.1)
+    assert first.geometry_collisions == 2 and world.pair_collisions == 0
 
 
 @pytest.mark.parametrize(
@@ -100,6 +115,17 @@ def test_scores_virtual_round_once(arena, choice, pose_b, expected):
     referee.choose(B, f"1:{choice}", 0.23)
     assert referee.ready and referee.round == 2
     assert tuple(referee.scores.values()) == expected
+
+
+def test_referee_rejects_scoring_through_box(arena):
+    referee = Referee(replace(arena, obstacles=((1.48, 1.9, 1.52, 2.1),)))
+    for seq in range(1, 4):
+        for robot in ROBOT_IDS:
+            report(referee, robot, seq, 0.05 * seq, SCORING_STARTS[robot])
+    referee.choose(A, "1:left", 0.2)
+    referee.choose(B, "1:left", 0.2)
+    assert tuple(referee.scores.values()) == (0, 0)
+    assert referee.result == "双方未进入判分条件"
 
 
 def test_referee_pauses_and_invalidates_delayed_round_input(arena):

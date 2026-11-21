@@ -3,7 +3,6 @@
 from pathlib import Path
 
 from alohamini_navigation.launching import configured_file, include, model_config, navigation_nodes
-from alohamini_navigation.maps import validate_map_revision
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
@@ -27,7 +26,6 @@ def _nodes(context, *, simulation):
     arena_path = Path(value("arena")).expanduser().resolve()
     if not map_path.is_file() or map_path.suffix not in (".yaml", ".yml"):
         raise ValueError("map 必须指向双车共用的地图 YAML 文件")
-    validate_map_revision(map_path, "alohamini2edu")
     arena = Arena.load(arena_path, map_path)
     x, y, yaw = arena.starts[robot_id]
     params, cleanup = configured_file(model_config("alohamini2edu", "nav2"), "nav2")

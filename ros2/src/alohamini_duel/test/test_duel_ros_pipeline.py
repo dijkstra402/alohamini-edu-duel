@@ -2,10 +2,12 @@
 
 import fcntl
 import json
+import math
 import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -56,12 +58,20 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     for vehicle in preflight["双车"].values():
         assert vehicle["检查"]["起点位置偏差在限值内"]
         assert vehicle["检查"]["起点朝向偏差在限值内"]
+        assert vehicle["检查"]["本车名义净空"]
+        assert vehicle["检查"]["实时栅格元数据与地图文件一致"]
+        assert vehicle["检查"]["地图服务器处于活动状态"]
+        assert vehicle["检查"]["定位节点处于活动状态"]
         assert vehicle["距标定起点_m"] <= 0.20
         assert vehicle["起点朝向偏差_deg"] <= 20
     assert checks["断联停稳"]["记录完整"]
     marked = checks["断联停稳"]
     assert marked["通过"] and marked["0.5秒内停稳"] and marked["可用于0.5秒验收"]
-    assert marked["双车"]["sword_a"]["故障前轮速显示运动"]
+    assert all(car["故障前轮速显示运动"] for car in marked["双车"].values())
+    speeds = checks["故障前双车纵向速度_m_s"]
+    threshold = 0.025 if use_nav2 else 0.05
+    assert speeds["sword_a"] > threshold
+    assert (-speeds["shield_b"] if use_nav2 else speeds["shield_b"]) > threshold
     assert marked["故障标记"]["来源"] == "仿真 UDP 转发器双向断开"
     marker = json.loads((output / "stop_watch_event.json").read_text(encoding="utf-8"))
     assert marked["故障标记"]["单调时间_ns"] == marker["triggered_ns"]
@@ -79,7 +89,10 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     assert set(checks["重连后两路输入下保持禁用和零速"]) == {"73", "74"}
     assert all(count >= 3 for count in checks["重连后两路输入下保持禁用和零速"].values())
     assert checks["有序停机"]
-    assert all(scan["unexpected"] > 0 for scan in checks["雷达差分"].values())
+    assert all(
+        scan["background"] > 0 and 0 < scan["对端包络命中"] <= scan["unexpected"]
+        for scan in checks["雷达差分"].values()
+    )
     assert checks["电子判分"]["scores"] == {"sword_a": 0, "shield_b": int(use_nav2)}
     assert ("断联取消航点" in checks) == use_nav2
     assert ("固定航点终点" in checks) == use_nav2
@@ -126,6 +139,13 @@ def test_both_prescribed_routes_and_same_round(tmp_path, duel_package_lookup):
     assert trace["墙和箱体净空通过"]
     assert trace["最小中心距_m"] > 0.9
     assert 0 < trace["最大采样间隔_s"] <= 0.20
+    assert set(trace["碰撞计数"]) == {"sword_a", "shield_b"}
+    for count in trace["碰撞计数"].values():
+        assert count["墙箱回退"] == count["双车回退"] == 0
+    assert all(
+        scan["background"] > 0 and 0 < scan["对端包络命中"] <= scan["unexpected"]
+        for scan in checks["雷达差分"].values()
+    )
     assert all(len(path) == 2 for path in trace["航点"].values())
     assert all(
         0 <= visit["平面误差_m"] <= 0.15
@@ -135,6 +155,98 @@ def test_both_prescribed_routes_and_same_round(tmp_path, duel_package_lookup):
     assert checks["电子判分"]["scores"] == {"sword_a": 0, "shield_b": 0}
     assert checks["电子判分"]["result"] == "双方未进入判分条件"
     assert checks["有序停机"]
+
+
+def test_dual_domain_referee_scores_and_discards_partial_choice(
+    tmp_path, monkeypatch, duel_package_lookup,
+):
+    from alohamini_duel.acceptance import stop_process
+    from alohamini_duel.arena import ROBOT_IDS, Arena
+    from alohamini_duel.ros_domains import attach_domain
+    from rclpy.node import Node
+    from std_msgs.msg import String
+
+    config = Path(__file__).parents[1] / "config"
+    arena_path, map_path = config / "arena_example.yaml", config / "duel_arena_map.yaml"
+    arena = Arena.load(arena_path, map_path)
+    monkeypatch.setenv("ROS_LOCALHOST_ONLY", "1")
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    monkeypatch.setenv("CYCLONEDDS_URI", (config / "cyclonedds_sim.xml").read_text())
+    domains = (81, 82)
+    poses = [(1.0, 1.4, 0.0), (2.0, 1.4, math.pi)]
+    online = [True, True]
+    boards = {}
+    zero = {robot: 0 for robot in ROBOT_IDS}
+    facing_score = zero | {"sword_a": 1}
+    side_score = zero | {"sword_a": 3}
+
+    with ExitStack() as resources:
+        log_path = tmp_path / "referee.log"
+        log = resources.enter_context(log_path.open("w", encoding="utf-8"))
+        process = subprocess.Popen(
+            [
+                "ros2", "run", "alohamini_duel", "duel_referee",
+                "--arena", str(arena_path), "--map", str(map_path), "--domains", *map(str, domains),
+            ],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        resources.callback(stop_process, process)
+        endpoints = [
+            attach_domain(
+                resources, domain, lambda context: Node("duel_referee_test", context=context),
+            )
+            for domain in domains
+        ]
+        nodes, executors = zip(*endpoints, strict=True)
+        statuses = [node.create_publisher(String, "/duel/local_status", 1) for node in nodes]
+        choices = [node.create_publisher(String, "/duel/choice", 10) for node in nodes]
+        for index, node in enumerate(nodes):
+            node.create_subscription(
+                String, "/duel/scoreboard",
+                lambda message, slot=index: boards.update({slot: json.loads(message.data)}), 1,
+            )
+        seq = 0
+
+        def wait_for(round_id, ready, pending, scores, messages=()):
+            nonlocal seq
+            deadline = time.monotonic() + 5
+            expected = {"round": round_id, "ready": ready, "choices_pending": pending, "scores": scores}
+            while time.monotonic() < deadline and process.poll() is None:
+                seq += 1
+                for index, (publisher, robot) in enumerate(zip(statuses, ROBOT_IDS, strict=True)):
+                    publisher.publish(String(data=json.dumps({
+                        "robot_id": robot, "arena_id": arena.fingerprint, "session_id": "回归",
+                        "seq": seq, "pose": poses[index], "online": online[index],
+                    })))
+                for index, choice in messages:
+                    choices[index].publish(String(data=choice))
+                for executor in executors:
+                    executor.spin_once(timeout_sec=0.02)
+                if len(boards) == 2 and all(
+                    all(board[key] == value for key, value in expected.items()) for board in boards.values()
+                ):
+                    return
+            pytest.fail(f"未观察到裁判状态 {expected}。收到 {boards}。{log_path.read_text()}")
+
+        wait_for(1, True, 0, zero)
+        wait_for(2, True, 0, facing_score, ((0, "1:left"), (1, "1:left")))
+        assert all(board["result"] == "A 车获得正向得分" for board in boards.values())
+
+        online[1] = False
+        wait_for(3, False, 0, facing_score)
+        poses[1], online[1] = (2.0, 1.4, math.pi / 2), True
+        wait_for(3, True, 0, facing_score)
+        wait_for(4, True, 0, side_score, ((0, "3:left"), (1, "3:right")))
+        assert all(board["result"] == "A 车获得侧向得分" for board in boards.values())
+
+        wait_for(4, True, 1, side_score, ((0, "4:right"),))
+        online[1] = False
+        wait_for(5, False, 0, side_score)
+        assert all(board["result"] == "联机中断，回合已暂停" for board in boards.values())
+        poses[1], online[1] = (2.0, 1.4, math.pi), True
+        wait_for(5, True, 0, side_score)
+        wait_for(5, True, 1, side_score, ((0, "4:right"), (1, "5:left")))
+        wait_for(6, True, 0, side_score | {"sword_a": 4}, ((0, "5:left"),))
 
 
 def test_acceptance_rejects_simultaneous_runs_with_one_shared_domain(

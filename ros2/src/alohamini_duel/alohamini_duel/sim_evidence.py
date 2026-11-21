@@ -2,9 +2,22 @@
 
 from dataclasses import dataclass
 
-from .arena import BASE_RADIUS, ROBOT_IDS, segment_distance
+from .arena import BASE_RADIUS, ROBOT_IDS, local_point, segment_distance
+from .radar import DEFAULT_MAP_TOLERANCE
+from .shared_sim_world import HALF_WIDTH
 
 STOP_FRAMES = 5
+
+
+def peer_radar_hits(arena, peer_pose, points, background):
+    if background <= 0:
+        return 0
+    margin = HALF_WIDTH + DEFAULT_MAP_TOLERANCE
+    matches = 0
+    for point in points:
+        x, y = local_point(peer_pose, arena.local(point))
+        matches += abs(x) <= margin and abs(y) <= margin
+    return matches
 
 
 @dataclass
@@ -47,6 +60,12 @@ class RoundTrace:
         self.count = 0
         self.min_distance = float("inf")
         self.max_gap = 0.0
+        self.collisions = {}
+
+    def observe_collisions(self, robot, stamp, geometry, pair):
+        if geometry or pair:
+            raise RuntimeError(f"{robot} 仿真发生碰撞回退，墙箱 {geometry} 次，双车 {pair} 次")
+        self.collisions[robot] = {"stamp_ns": stamp, "墙箱回退": geometry, "双车回退": pair}
 
     def observe(self, robot, stamp, position):
         if stamp <= self.last_stamp:

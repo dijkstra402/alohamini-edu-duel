@@ -85,7 +85,7 @@ class Simulator(Node):
     def tick(self):
         self.publish_frame(self.world.step(*self.requested_velocity(), STEP_PERIOD))
 
-    def publish_frame(self, velocity):
+    def publish_frame(self, velocity, *, pair_collisions=0):
         vx, vy, wz = velocity
         self.steps += 1
         nanoseconds = 1_000_000_000 + self.steps * round(STEP_PERIOD * 1_000_000_000)
@@ -136,6 +136,11 @@ class Simulator(Node):
                     {
                         "_robot_metadata": {"robot_model": self.model},
                         "_safety": {"host_session_id": self.session},
+                        "_simulation": {
+                            "stamp_ns": nanoseconds,
+                            "geometry_collisions": self.world.geometry_collisions,
+                            "pair_collisions": pair_collisions,
+                        },
                     }
                 )
             )

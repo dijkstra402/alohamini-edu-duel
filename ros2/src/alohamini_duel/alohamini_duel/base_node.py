@@ -19,9 +19,10 @@ from .arena import ROBOT_IDS, Arena
 from .cmd_vel_arbiter import STOP, VelocityArbiter
 from .peer_sync import HEARTBEAT_PERIOD, MAX_PACKET_BYTES, PeerLink, open_peer_socket
 from .ros_domains import spin_until_shutdown
-from .status import yaw_from_quaternion
+from .status import MAX_POSE_AGE, yaw_from_quaternion
 
-MAX_POSE_AGE = 0.35
+MAX_DATAGRAMS_PER_TICK = 64
+UDP_DRAIN_BUDGET = HEARTBEAT_PERIOD / 10
 
 
 class DuelBase(Node):
@@ -130,11 +131,12 @@ class DuelBase(Node):
         return (point.x, point.y, yaw), twist.x, twist.y
 
     def _tick(self):
-        now = time.monotonic()
-        stamp = self.get_clock().now()
-        local = self._local_state(stamp.nanoseconds, now)
-        # 本轮发出的确认应包含已经到达的报文，避免多占用一个心跳周期。
-        for _ in range(16):
+        previous_remote = self.link.remote
+        drain_until = time.monotonic() + UDP_DRAIN_BUDGET
+        # 为定位采样和速度仲裁保留执行时间，同时及时确认突发到包。
+        for _ in range(MAX_DATAGRAMS_PER_TICK):
+            if time.monotonic() >= drain_until:
+                break
             try:
                 data = self.udp.recv(MAX_PACKET_BYTES + 1)
             except BlockingIOError:
@@ -143,12 +145,17 @@ class DuelBase(Node):
                 self.get_logger().warning("UDP 心跳接收失败", throttle_duration_sec=3.0)
                 break
             if self.forward_peer_packets:
-                self.link.accept(data, now)
+                self.link.accept(data, time.monotonic())
+        # 先处理本轮确认，再采集位姿。对端用被确认的发送时间估算通信陈旧度。
+        now = time.monotonic()
+        stamp = self.get_clock().now()
+        local = self._local_state(stamp.nanoseconds, now)
         if local is not None and self.forward_peer_packets:
             try:
                 self.udp.send(self.link.encode(*local, now=now))
             except OSError:
                 self.get_logger().warning("UDP 心跳发送失败", throttle_duration_sec=3.0)
+        now = time.monotonic()
         peer = self.link.online(now) if local is not None else None
         online = peer is not None
         if not online and self.arbiter.enabled:
@@ -176,7 +183,7 @@ class DuelBase(Node):
                 "motion_enabled": self.arbiter.enabled,
             }
             self.status_pub.publish(String(data=json.dumps(status)))
-        if peer is not None and peer.received_at == now:
+        if peer is not None and peer is not previous_remote:
             opponent = PoseStamped()
             opponent.header.frame_id = "map"
             opponent.header.stamp = stamp.to_msg()

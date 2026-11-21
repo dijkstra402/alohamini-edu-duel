@@ -19,6 +19,7 @@ def rectangle(rect):
 class World:
     def __init__(self, config):
         self.bounds = config["bounds"]
+        self.geometry_collisions = 0
         self.obstacles = config.get("obstacles", [])
         self.segments = rectangle(self.bounds)
         for rect in self.obstacles:
@@ -52,6 +53,7 @@ class World:
         if self.free(x, y):
             self.x, self.y = x, y
         else:
+            self.geometry_collisions += 1
             vx = vy = 0.0
         self.yaw = math.atan2(math.sin(self.yaw + wz * dt), math.cos(self.yaw + wz * dt))
         return vx, vy, wz

@@ -28,6 +28,7 @@ class SharedVehicle(World):
 
 class SharedDuelWorld:
     def __init__(self, arena: Arena):
+        self.pair_collisions = 0
         self.vehicles = tuple(
             SharedVehicle(
                 {
@@ -52,6 +53,7 @@ class SharedDuelWorld:
         start_delta = (previous[0][0] - previous[1][0], previous[0][1] - previous[1][1])
         end_delta = (first.x - second.x, first.y - second.y)
         if segment_distance(start_delta, end_delta, (0.0, 0.0)) <= 2 * BASE_RADIUS:
+            self.pair_collisions += 1
             # 两车提案来源于同一时刻，检测相对扫掠后一起撤回平移。
             for vehicle, position in zip(self.vehicles, previous, strict=True):
                 vehicle.x, vehicle.y = position

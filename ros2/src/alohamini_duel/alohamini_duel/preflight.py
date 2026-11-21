@@ -2,25 +2,30 @@
 
 import json
 import math
+import struct
 import time
 from contextlib import ExitStack
+from pathlib import Path
 
+import yaml
+from PIL import Image
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import Twist, TwistWithCovarianceStamped
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
+from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
 
-from .arena import BASE_RADIUS, ROBOT_IDS, Arena
+from .arena import BASE_RADIUS, ROBOT_IDS, Arena, coordinates
 from .cmd_vel_arbiter import COMMAND_TIMEOUT
 from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
-from .status import VehicleStatus, angle_error, fresh_stamp, wheel_is_stationary
+from .status import VehicleStatus, angle_error, fresh_stamp, wheel_is_stationary, yaw_from_quaternion
 
 BRIDGE = "alohamini_lerobot_bridge"
 ARBITER = "alohamini_duel_base"
@@ -30,12 +35,33 @@ POSITION_CHECK = "起点位置偏差在限值内"
 HEADING_CHECK = "起点朝向偏差在限值内"
 BRIDGE_TOPIC_CHECK = "真机桥接解析后的速度入口正确"
 BRIDGE_TIMEOUT_CHECK = "真机桥接速度看门狗在限值内"
-STATUS_CHECKS = ("定位和地图一致", "双向心跳", "仲裁未使能", POSITION_CHECK, HEADING_CHECK)
+CLEARANCE_CHECK = "本车名义净空"
+MAP_CHECK = "实时栅格元数据与地图文件一致"
+LIFECYCLE_NODES = {
+    MONITOR: "碰撞监测处于活动状态", "map_server": "地图服务器处于活动状态",
+    "amcl": "定位节点处于活动状态",
+}
+STATUS_CHECKS = (
+    "定位和地图一致", "双向心跳", "仲裁未使能", POSITION_CHECK, HEADING_CHECK, CLEARANCE_CHECK,
+)
+
+
+def load_map_metadata(path):
+    path = Path(path)
+    data = yaml.safe_load(path.read_bytes())
+    resolution, = coordinates([data.get("resolution")], 1, "地图分辨率")
+    if resolution <= 0:
+        raise ValueError("地图分辨率必须为正数")
+    # OccupancyGrid 的分辨率以 float32 表示。
+    resolution, = struct.unpack("f", struct.pack("f", resolution))
+    with Image.open(path.parent / data["image"]) as image:
+        return resolution, image.size, coordinates(data.get("origin"), 3, "地图原点")
 
 
 class VehicleCheck(Node):
     def __init__(
-        self, context, arena, robot_id, simulation, *, position_limit=None, heading_limit=None
+        self, context, arena, robot_id, simulation, *, map_metadata,
+        position_limit=None, heading_limit=None,
     ):
         super().__init__(
             f"duel_check_{robot_id}",
@@ -43,6 +69,8 @@ class VehicleCheck(Node):
             parameter_overrides=[Parameter("use_sim_time", value=simulation)],
         )
         self.arena, self.robot_id = arena, robot_id
+        self.map_metadata = map_metadata
+        self.map_matches = False
         self.position_limit, self.heading_limit = position_limit, heading_limit
         self.samples: dict[str, tuple[int, float]] = {}
         self.status: VehicleStatus | None = None
@@ -58,7 +86,13 @@ class VehicleCheck(Node):
             (Twist, "/cmd_vel_safe", self.on_safe_velocity),
         ):
             self.create_subscription(kind, topic, callback, qos_profile_sensor_data)
-        self.lifecycle = self.create_client(GetState, f"/{MONITOR}/get_state")
+        self.create_subscription(
+            OccupancyGrid, "/map", self.on_map,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self.lifecycle_clients = {
+            name: self.create_client(GetState, f"/{name}/get_state") for name in LIFECYCLE_NODES
+        }
         self.bridge_params = None
         if not simulation:
             self.create_subscription(
@@ -106,6 +140,11 @@ class VehicleCheck(Node):
         self.record("定位和地图一致", status.pose is not None)
         self.record("双向心跳", status.online)
         self.record("仲裁未使能", status.motion_enabled is False)
+        self.record(
+            CLEARANCE_CHECK,
+            status.pose is not None
+            and self.arena.path_clear(status.pose[:2], status.pose[:2], BASE_RADIUS),
+        )
         if self.position_limit is not None or self.heading_limit is not None:
             position_error, heading_error = self.start_errors(status.pose)
             if self.position_limit is not None:
@@ -116,6 +155,21 @@ class VehicleCheck(Node):
                 self.record(
                     HEADING_CHECK, heading_error is not None and heading_error <= self.heading_limit
                 )
+
+    def on_map(self, message):
+        info = message.info
+        expected_resolution, size, (x, y, yaw) = self.map_metadata
+        point, q = info.origin.position, info.origin.orientation
+        self.map_matches = (
+            message.header.frame_id == "map"
+            and info.resolution == expected_resolution
+            and (info.width, info.height) == size
+            and len(message.data) == info.width * info.height
+            and (point.x, point.y, point.z) == (x, y, 0.0)
+            and q.x == q.y == 0.0
+            and math.isclose(math.hypot(q.z, q.w), 1.0, abs_tol=1e-9)
+            and angle_error(yaw, yaw_from_quaternion(q)) <= 1e-9
+        )
 
     def on_scan(self, message):
         valid = sum(
@@ -154,11 +208,6 @@ class VehicleCheck(Node):
             self.record("真机桥接健康且未使能", ok, max_gap=1.5)
 
     def read_services(self):
-        lifecycle = (
-            self.lifecycle.call_async(GetState.Request())
-            if self.lifecycle.service_is_ready()
-            else None
-        )
         parameters = (
             self.bridge_params.call_async(
                 GetParameters.Request(names=["base_only", "cmd_vel_topic", "command_timeout_sec"])
@@ -166,14 +215,20 @@ class VehicleCheck(Node):
             if self.bridge_params is not None and self.bridge_params.service_is_ready()
             else None
         )
-        return lifecycle, parameters
+        return (
+            {
+                name: client.call_async(GetState.Request()) if client.service_is_ready() else None
+                for name, client in self.lifecycle_clients.items()
+            },
+            parameters,
+        )
 
     def results(self, lifecycle, parameters):
         checks = {
             name: self.recent(name)
             for name in (
                 "定位和地图一致", "双向心跳", "仲裁未使能", "新鲜雷达", "新鲜惯导",
-                "底盘反馈静止", "仲裁输出零速",
+                "底盘反馈静止", "仲裁输出零速", CLEARANCE_CHECK,
             )
         }
         cmd_publishers = [item.node_name for item in self.get_publishers_info_by_topic("/cmd_vel")]
@@ -186,8 +241,12 @@ class VehicleCheck(Node):
         safe_consumers = [
             item.node_name for item in self.get_subscriptions_info_by_topic("/cmd_vel_safe")
         ]
-        active = lifecycle is not None and lifecycle.current_state.id == State.PRIMARY_STATE_ACTIVE
-        checks["碰撞监测处于活动状态"] = active
+        for name, label in LIFECYCLE_NODES.items():
+            reply = lifecycle.get(name)
+            checks[label] = reply is not None and reply.current_state.id == State.PRIMARY_STATE_ACTIVE
+        checks[MAP_CHECK] = self.map_matches and [
+            item.node_name for item in self.get_publishers_info_by_topic("/map")
+        ] == ["map_server"]
         checks["监测出口未出现非零指令"] = not self.nonzero_safe_velocity
         checks["速度链路只有一个仲裁和一个监测出口"] = (
             cmd_publishers == [ARBITER]
@@ -217,9 +276,6 @@ class VehicleCheck(Node):
         if self.bridge_params is None:
             checks["仿真底盘订阅监测出口"] = SIMULATOR in safe_consumers
         pose = self.status.pose if checks["定位和地图一致"] else None
-        checks["本车名义净空"] = pose is not None and self.arena.path_clear(
-            pose[:2], pose[:2], BASE_RADIUS
-        )
         position_error, heading_error = self.start_errors(pose)
         if self.position_limit is not None:
             checks[POSITION_CHECK] = self.recent(POSITION_CHECK)
@@ -255,6 +311,7 @@ def main(args=None):
     if heading_limit is not None and not 0 <= heading_limit <= 180:
         parser.error("起点朝向限值必须在 0 到 180 度之间")
     arena = Arena.load(arguments.arena, arguments.map)
+    map_metadata = load_map_metadata(arguments.map)
     with ExitStack() as resources:
         endpoints = [
             attach_domain(
@@ -262,7 +319,7 @@ def main(args=None):
                 domain,
                 lambda context, robot=robot: VehicleCheck(
                     context, arena, robot, arguments.simulation,
-                    position_limit=position_limit, heading_limit=heading_limit,
+                    map_metadata=map_metadata, position_limit=position_limit, heading_limit=heading_limit,
                 ),
             )
             for robot, domain in zip(ROBOT_IDS, arguments.domains, strict=True)
@@ -274,20 +331,21 @@ def main(args=None):
                 executor.spin_once(timeout_sec=0.02)
         pending = [node.read_services() for node in nodes]
         deadline = time.monotonic() + 1
+        futures = [future for states, params in pending for future in (*states.values(), params)]
         while time.monotonic() < deadline and any(
-            future is not None and not future.done() for group in pending for future in group
+            future is not None and not future.done() for future in futures
         ):
             for executor in executors:
                 executor.spin_once(timeout_sec=0.02)
         results = {}
-        for node, domain, futures in zip(nodes, arguments.domains, pending, strict=True):
-            replies = [
-                future.result()
-                if future is not None and future.done() and future.exception() is None
-                else None
-                for future in futures
-            ]
-            results[node.robot_id] = node.results(*replies) | {"ROS域": domain}
+        def service_reply(future):
+            if future is not None and future.done() and future.exception() is None:
+                return future.result()
+            return None
+
+        for node, domain, (states, params) in zip(nodes, arguments.domains, pending, strict=True):
+            lifecycle = {name: service_reply(future) for name, future in states.items()}
+            results[node.robot_id] = node.results(lifecycle, service_reply(params)) | {"ROS域": domain}
     first, second = (item["位姿"] for item in results.values())
     separation = math.dist(first[:2], second[:2]) if first and second else None
     clear = separation is not None and separation > 2 * BASE_RADIUS

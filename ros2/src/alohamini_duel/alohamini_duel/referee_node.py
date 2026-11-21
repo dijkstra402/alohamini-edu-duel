@@ -92,7 +92,11 @@ class Referee:
         first, second = (self.players[robot].pose for robot in ROBOT_IDS)
         dx, dy = second[0] - first[0], second[1] - first[1]
         heading = math.atan2(dy, dx)
-        if not 0.85 <= math.hypot(dx, dy) <= 1.15 or angle_error(heading, first[2]) >= math.pi / 9:
+        if (
+            not 0.85 <= math.hypot(dx, dy) <= 1.15
+            or angle_error(heading, first[2]) >= math.pi / 9
+            or not self.arena.path_clear(first[:2], second[:2], 0.0)
+        ):
             return "双方未进入判分条件"
         if angle_error(heading + math.pi, second[2]) > math.pi / 6:
             self.scores[FIRST] += 2
@@ -108,6 +112,7 @@ class Referee:
             {
                 "round": self.round,
                 "ready": self.ready,
+                "choices_pending": len(self.choices),
                 "scores": self.scores,
                 "result": self.result,
             },

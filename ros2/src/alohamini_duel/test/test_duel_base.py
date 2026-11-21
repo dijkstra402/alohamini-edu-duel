@@ -4,6 +4,7 @@ import select
 import socket
 import time
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,6 +27,14 @@ def arena(tmp_path):
     map_file.write_text("image: map.pgm\nresolution: 0.05\norigin: [0, 0, 0]\n")
     (tmp_path / "map.pgm").write_bytes(b"P5\n1 1\n255\n\0")
     return Arena.load(config, map_file)
+
+
+@pytest.fixture
+def map_metadata(arena, tmp_path):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_duel.preflight import load_map_metadata
+
+    return load_map_metadata(tmp_path / "map.yaml")
 
 
 def exchange(a, b, now):
@@ -59,6 +68,16 @@ def test_map_fingerprint_includes_grid_and_invalid_start_is_rejected(arena, tmp_
         Arena.load(config, map_file)
 
 
+def test_arena_load_rejects_managed_map_for_another_model(arena, tmp_path):
+    config = Path(__file__).parents[1] / "config/arena_example.yaml"
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"status": "complete", "robot_model": "alohamini2pro"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="another robot model"):
+        Arena.load(config, tmp_path / "map.yaml")
+
+
 def test_vehicle_status_distinguishes_motion_permission_and_validates_identity(arena):
     frame = {
         "robot_id": ROBOT_IDS[0],
@@ -83,12 +102,12 @@ def test_vehicle_status_distinguishes_motion_permission_and_validates_identity(a
         assert VehicleStatus.decode(json.dumps(frame | invalid), ROBOT_IDS[0], arena) is None
 
 
-def test_preflight_start_limits_require_recent_samples_in_the_same_session(arena):
+def test_preflight_start_limits_require_recent_samples_in_the_same_session(arena, map_metadata):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     from rclpy.context import Context
     from std_msgs.msg import String
 
-    from alohamini_duel.preflight import HEADING_CHECK, POSITION_CHECK, VehicleCheck
+    from alohamini_duel.preflight import CLEARANCE_CHECK, HEADING_CHECK, POSITION_CHECK, VehicleCheck
 
     robot = ROBOT_IDS[0]
     arena = replace(
@@ -104,36 +123,99 @@ def test_preflight_start_limits_require_recent_samples_in_the_same_session(arena
         context.init(args=[], domain_id=92)
         resources.callback(context.try_shutdown)
         node = VehicleCheck(
-            context, arena, robot, False, position_limit=0.10, heading_limit=3.0
+            context, arena, robot, False, map_metadata=map_metadata,
+            position_limit=0.10, heading_limit=3.0,
         )
         resources.callback(node.destroy_node)
-        for sequence in (1, 2, 3):
+        for sequence in (1, 2, 2):
             node.on_status(String(data=json.dumps(frame | {"seq": sequence})))
-        passed = node.results(None, None)
+        assert not node.results({}, None)["检查"][CLEARANCE_CHECK]
+        node.on_status(String(data=json.dumps(frame | {"seq": 3})))
+        passed = node.results({}, None)
         assert passed["检查"][POSITION_CHECK]
+        assert passed["检查"][CLEARANCE_CHECK]
         assert passed["检查"][HEADING_CHECK]
         assert passed["距标定起点_m"] == pytest.approx(0.05)
         assert passed["起点朝向偏差_deg"] == pytest.approx(2.0)
 
         displaced = frame | {"seq": 4, "pose": [POSE_A[0] + 0.15, *frame["pose"][1:]]}
         node.on_status(String(data=json.dumps(displaced)))
-        displaced_checks = node.results(None, None)["检查"]
+        displaced_checks = node.results({}, None)["检查"]
         assert not displaced_checks[POSITION_CHECK]
         assert displaced_checks[HEADING_CHECK]
 
         rotated = frame | {"seq": 5, "pose": [*frame["pose"][:2], math.radians(-170)]}
         node.on_status(String(data=json.dumps(rotated)))
-        assert not node.results(None, None)["检查"][HEADING_CHECK]
+        assert not node.results({}, None)["检查"][HEADING_CHECK]
         for sequence in (6, 7, 8):
             node.on_status(String(data=json.dumps(frame | {"seq": sequence})))
-        assert node.results(None, None)["检查"][POSITION_CHECK]
+        assert node.results({}, None)["检查"][POSITION_CHECK]
         restarted = frame | {"seq": 1, "session_id": "会话二"}
         node.on_status(String(data=json.dumps(restarted)))
-        assert not node.results(None, None)["检查"][POSITION_CHECK]
+        assert not node.results({}, None)["检查"][POSITION_CHECK]
+        assert not node.results({}, None)["检查"][CLEARANCE_CHECK]
         wrong_map = restarted | {"seq": 2, "arena_id": "不同场地"}
         node.on_status(String(data=json.dumps(wrong_map)))
-        assert not node.results(None, None)["检查"]["定位和地图一致"]
-        assert node.results(None, None)["距标定起点_m"] is None
+        assert not node.results({}, None)["检查"]["定位和地图一致"]
+        assert node.results({}, None)["距标定起点_m"] is None
+
+
+def test_preflight_requires_retained_map_geometry_and_active_localization(arena, map_metadata):
+    from lifecycle_msgs.msg import State
+    from lifecycle_msgs.srv import GetState
+    from nav_msgs.msg import OccupancyGrid
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile
+
+    from alohamini_duel.preflight import LIFECYCLE_NODES, MAP_CHECK, VehicleCheck
+
+    with ExitStack() as resources:
+        context = Context()
+        context.init(args=[], domain_id=92)
+        resources.callback(context.try_shutdown)
+        source = Node("map_server", context=context)
+        resources.callback(source.destroy_node)
+        publisher = source.create_publisher(
+            OccupancyGrid, "/map", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        )
+        grid = OccupancyGrid()
+        grid.header.frame_id = "map"
+        grid.info.resolution, (grid.info.width, grid.info.height), _ = map_metadata
+        grid.info.origin.orientation.w = 1.0
+        grid.data = [0]
+        publisher.publish(grid)
+        node = VehicleCheck(context, arena, ROBOT_IDS[0], False, map_metadata=map_metadata)
+        resources.callback(node.destroy_node)
+        executor = SingleThreadedExecutor(context=context)
+        resources.callback(executor.shutdown)
+        executor.add_node(node)
+        executor.add_node(source)
+        active = GetState.Response(current_state=State(id=State.PRIMARY_STATE_ACTIVE))
+        inactive = GetState.Response(current_state=State(id=State.PRIMARY_STATE_INACTIVE))
+        states = dict.fromkeys(LIFECYCLE_NODES, active)
+        assert not node.results(states, None)["检查"][MAP_CHECK]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not node.results(states, None)["检查"][MAP_CHECK]:
+            executor.spin_once(timeout_sec=0.05)
+        checks = node.results(states, None)["检查"]
+        assert checks[MAP_CHECK]
+        assert all(checks[label] for label in LIFECYCLE_NODES.values())
+        checks = node.results({"map_server": inactive}, None)["检查"]
+        assert not checks[LIFECYCLE_NODES["map_server"]]
+        assert not checks[LIFECYCLE_NODES["amcl"]]
+
+        for mismatch in (
+            lambda info: setattr(info, "resolution", 0.025),
+            lambda info: setattr(info, "width", 2),
+            lambda info: setattr(info.origin.position, "y", 0.1),
+            lambda info: setattr(info.origin.orientation, "z", 1.0),
+        ):
+            changed = deepcopy(grid)
+            mismatch(changed.info)
+            node.on_map(changed)
+            assert not node.results(states, None)["检查"][MAP_CHECK]
 
 
 @pytest.mark.parametrize("limits", [
@@ -151,7 +233,7 @@ def test_hardware_preflight_requires_both_start_limits(limits, capsys):
     assert "真机预检必须指定" in capsys.readouterr().err
 
 
-def test_preflight_rejects_legacy_bridge_and_invalid_watchdog(arena):
+def test_preflight_rejects_legacy_bridge_and_invalid_watchdog(arena, map_metadata):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     from rcl_interfaces.srv import GetParameters
@@ -164,7 +246,7 @@ def test_preflight_rejects_legacy_bridge_and_invalid_watchdog(arena):
         context = Context()
         context.init(args=[], domain_id=92)
         resources.callback(context.try_shutdown)
-        node = VehicleCheck(context, arena, ROBOT_IDS[0], False)
+        node = VehicleCheck(context, arena, ROBOT_IDS[0], False, map_metadata=map_metadata)
         resources.callback(node.destroy_node)
         status = DiagnosticStatus(
             name="AlohaMini Host state bridge",
@@ -178,7 +260,7 @@ def test_preflight_rejects_legacy_bridge_and_invalid_watchdog(arena):
         message = DiagnosticArray(status=[status])
         node.on_diagnostics(message)
         node.on_diagnostics(message)
-        checks = node.results(None, None)["检查"]
+        checks = node.results({}, None)["检查"]
         assert checks["真机桥接健康且未使能"]
         assert not checks[BRIDGE_TOPIC_CHECK]
         assert not checks[BRIDGE_TIMEOUT_CHECK]
@@ -194,11 +276,11 @@ def test_preflight_rejects_legacy_bridge_and_invalid_watchdog(arena):
             response = GetParameters.Response(
                 values=values + [Parameter("command_timeout_sec", value=timeout).get_parameter_value()]
             )
-            assert node.results(None, response)["检查"][BRIDGE_TIMEOUT_CHECK] is expected
+            assert node.results({}, response)["检查"][BRIDGE_TIMEOUT_CHECK] is expected
 
 
 @pytest.mark.parametrize("resolved", ["/cmd_vel_safe", "/cmd_vel"])
-def test_preflight_reads_real_bridge_parameters_and_resolved_topic(arena, resolved):
+def test_preflight_reads_real_bridge_parameters_and_resolved_topic(arena, map_metadata, resolved):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     from alohamini_bridge.bridge_node import AlohaMiniBridge
     from rclpy.context import Context
@@ -211,7 +293,7 @@ def test_preflight_reads_real_bridge_parameters_and_resolved_topic(arena, resolv
         context = Context()
         context.init(args=[], domain_id=92)
         resources.callback(context.try_shutdown)
-        node = VehicleCheck(context, arena, ROBOT_IDS[0], False)
+        node = VehicleCheck(context, arena, ROBOT_IDS[0], False, map_metadata=map_metadata)
         resources.callback(node.destroy_node)
         bridge = AlohaMiniBridge(
             context=context,
@@ -243,7 +325,7 @@ def test_preflight_reads_real_bridge_parameters_and_resolved_topic(arena, resolv
                 not expected or node.recent(BRIDGE_TOPIC_CHECK, count=2, max_age=1.5)
             ):
                 break
-        report = node.results(None, pending.result())
+        report = node.results({}, pending.result())
         assert report["桥接解析后速度入口"] == resolved
         assert report["检查"][BRIDGE_TOPIC_CHECK] is expected
         assert report["检查"][BRIDGE_TIMEOUT_CHECK]
@@ -388,10 +470,12 @@ def udp_duel_base(arena, tmp_path):
         yield base, remote, refresh_pose
 
 
-def test_heartbeat_tick_acknowledges_packet_already_in_socket(arena, udp_duel_base):
+@pytest.mark.parametrize("burst", [1, 32])
+def test_heartbeat_tick_acknowledges_latest_packet_already_in_socket(arena, udp_duel_base, burst):
     base, remote, _ = udp_duel_base
     peer = PeerLink(ROBOT_IDS[1], arena)
-    remote.sendto(peer.encode(POSE_B, 0.0, 0.0, 1.0), base.udp.getsockname())
+    for _ in range(burst):
+        remote.sendto(peer.encode(POSE_B, 0.0, 0.0, 1.0), base.udp.getsockname())
     assert select.select([base.udp], [], [], 1)[0]
     base._tick()
     heartbeat = json.loads(remote.recv(1024))
@@ -449,7 +533,7 @@ def test_base_revokes_motion_permission_until_explicit_reenable(
 
 def test_arbitration_priority_timeout_and_stop_recovery(arena):
     arbiter = VelocityArbiter(arena)
-    peer = PeerState("会话", 1, POSE_B, 0)
+    peer = PeerState("会话", 1, POSE_B, 0, 0)
     nav = BodyVelocity(0.06, 0.0, 0.0)
     duel = BodyVelocity(0.0, -0.05, 0.0)
     arbiter.submit("nav", nav, 0)
@@ -474,11 +558,20 @@ def test_geometry_stops_at_wall_and_when_lateral_motion_closes_gap(arena):
     arbiter = VelocityArbiter(arena)
     arbiter.enable(True)
     arbiter.submit("duel", BodyVelocity(-0.1, 0, 0), 0)
-    peer = PeerState("会话", 1, POSE_B, 0)
+    peer = PeerState("会话", 1, POSE_B, 0, 0)
     assert arbiter.select((0.47, 0.62, 0.0), peer, 0.0) == STOP
     arbiter.submit("duel", BodyVelocity(0.0, 0.1, 0), 0)
-    close_peer = PeerState("会话", 1, (1.45, 2.36, 0), 0)
+    close_peer = PeerState("会话", 1, (1.45, 2.36, 0), 0, 0)
     assert arbiter.select(POSE_A, close_peer, 0.0) == STOP
     arbiter.submit("duel", BodyVelocity(0.3, 0.3, 0), 0)
     command = arbiter.select(POSE_A, peer, 0.0)
     assert math.hypot(command.x_m_s, command.y_m_s) == pytest.approx(MAX_SPEED)
+
+
+def test_geometry_budgets_tf_and_communication_age_even_for_newly_received_pose(arena):
+    arbiter = VelocityArbiter(arena)
+    velocity = BodyVelocity(0.0, MAX_SPEED, 0.0)
+    peer = PeerState("会话", 2, (1.45, 2.42, 0.0), 1.0, 1.0)
+    assert arbiter.limit(velocity, POSE_A, peer, 1.0) == velocity
+    assert arbiter.limit(velocity, POSE_A, replace(peer, pose=(1.45, 2.4, 0.0)), 1.0) == STOP
+    assert arbiter.limit(velocity, POSE_A, replace(peer, confirmed_send_at=0.8), 1.0) == STOP

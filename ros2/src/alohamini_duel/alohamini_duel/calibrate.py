@@ -8,7 +8,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import yaml
-from alohamini_navigation.maps import validate_map_revision
 
 from .arena import ROBOT_IDS, Arena, coordinates, local_point
 
@@ -71,7 +70,6 @@ def calibrate(measurements, map_file, output, tolerance):
         "obstacles": boundaries,
         "starts": starts,
     }
-    validate_map_revision(map_file, "alohamini2edu")
     map_data = yaml.safe_load(Path(map_file).read_bytes())
     if not isinstance(map_data, dict):
         raise ValueError("地图 YAML 必须包含栅格参数")

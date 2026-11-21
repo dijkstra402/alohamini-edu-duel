@@ -8,6 +8,7 @@ from .arena import Point, Pose, local_point
 from .status import fresh_stamp, yaw_from_quaternion
 
 OCCUPIED = 65
+DEFAULT_MAP_TOLERANCE = 0.12
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,7 @@ def main(args=None):
     class RadarDiagnostic(Node):
         def __init__(self):
             super().__init__("alohamini_duel_radar")
-            self.declare_parameter("map_tolerance_m", 0.12)
+            self.declare_parameter("map_tolerance_m", DEFAULT_MAP_TOLERANCE)
             self.tolerance = self.get_parameter("map_tolerance_m").value
             if not math.isfinite(self.tolerance) or self.tolerance <= 0:
                 raise ValueError("地图容差必须是有限正数")
