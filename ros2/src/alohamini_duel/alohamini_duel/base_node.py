@@ -82,11 +82,20 @@ class DuelBase(Node):
         self.arbiter.submit(source, velocity, time.monotonic())
 
     def _enable(self, request, response):
+        if request.data:
+            now = time.monotonic()
+            if (
+                not self.online or self.link.online(now) is None
+                or self._local_state(self.get_clock().now().nanoseconds, now) is None
+            ):
+                response.success = False
+                response.message = "定位或双向心跳未就绪，恢复后请重新请求使能"
+                return response
         self.arbiter.enable(request.data)
         if not request.data:
             self.velocity_pub.publish(Twist())
         response.success = True
-        response.message = "已等待双向心跳和速度指令" if request.data else "已停止并禁用速度输出"
+        response.message = "已使能，等待新速度指令" if request.data else "已停止并禁用速度输出"
         return response
 
     def _set_sim_link(self, request, response):
@@ -142,6 +151,8 @@ class DuelBase(Node):
                 self.get_logger().warning("UDP 心跳发送失败", throttle_duration_sec=3.0)
         peer = self.link.online(now) if local is not None else None
         online = peer is not None
+        if not online and self.arbiter.enabled:
+            self.arbiter.enable(False)
         if online != self.online:
             message = "双向心跳已就绪" if online else "本机定位失效，输出零速"
             if not online and local is not None:

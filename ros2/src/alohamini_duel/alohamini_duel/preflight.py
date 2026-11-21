@@ -9,6 +9,7 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import Twist, TwistWithCovarianceStamped
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
+from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -17,6 +18,7 @@ from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
 
 from .arena import BASE_RADIUS, ROBOT_IDS, Arena
+from .cmd_vel_arbiter import COMMAND_TIMEOUT
 from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
 from .status import VehicleStatus, angle_error, fresh_stamp, wheel_is_stationary
 
@@ -27,6 +29,7 @@ SIMULATOR = "alohamini_nav_sim"
 POSITION_CHECK = "起点位置偏差在限值内"
 HEADING_CHECK = "起点朝向偏差在限值内"
 BRIDGE_TOPIC_CHECK = "真机桥接解析后的速度入口正确"
+BRIDGE_TIMEOUT_CHECK = "真机桥接速度看门狗在限值内"
 STATUS_CHECKS = ("定位和地图一致", "双向心跳", "仲裁未使能", POSITION_CHECK, HEADING_CHECK)
 
 
@@ -141,8 +144,7 @@ class VehicleCheck(Node):
                 continue
             values = {item.key: item.value for item in status.values}
             resolved = values.get("resolved_cmd_vel_topic")
-            if resolved is not None:
-                self.resolved_bridge_topic = resolved
+            self.resolved_bridge_topic = resolved
             self.record(BRIDGE_TOPIC_CHECK, resolved == "/cmd_vel_safe", max_gap=1.5)
             ok = (
                 status.level == DiagnosticStatus.OK
@@ -159,7 +161,7 @@ class VehicleCheck(Node):
         )
         parameters = (
             self.bridge_params.call_async(
-                GetParameters.Request(names=["base_only", "cmd_vel_topic"])
+                GetParameters.Request(names=["base_only", "cmd_vel_topic", "command_timeout_sec"])
             )
             if self.bridge_params is not None and self.bridge_params.service_is_ready()
             else None
@@ -195,17 +197,23 @@ class VehicleCheck(Node):
             and SIMULATOR not in cmd_consumers
         )
         if self.bridge_params is not None:
+            values = parameters.values if parameters is not None else ()
             checks["真机桥接健康且未使能"] = self.recent(
                 "真机桥接健康且未使能", count=2, max_age=1.5
             )
             checks["真机桥接使用底盘模式和监测出口"] = (
-                parameters is not None
-                and len(parameters.values) == 2
-                and parameters.values[0].bool_value is True
-                and parameters.values[1].string_value == "/cmd_vel_safe"
+                len(values) == 3
+                and values[0].type == ParameterType.PARAMETER_BOOL
+                and values[0].bool_value
+                and values[1].type == ParameterType.PARAMETER_STRING
+                and values[1].string_value == "/cmd_vel_safe"
             )
-            if self.resolved_bridge_topic is not None:
-                checks[BRIDGE_TOPIC_CHECK] = self.recent(BRIDGE_TOPIC_CHECK, count=2, max_age=1.5)
+            checks[BRIDGE_TIMEOUT_CHECK] = (
+                len(values) == 3
+                and values[2].type == ParameterType.PARAMETER_DOUBLE
+                and 0 < values[2].double_value <= COMMAND_TIMEOUT
+            )
+            checks[BRIDGE_TOPIC_CHECK] = self.recent(BRIDGE_TOPIC_CHECK, count=2, max_age=1.5)
         if self.bridge_params is None:
             checks["仿真底盘订阅监测出口"] = SIMULATOR in safe_consumers
         pose = self.status.pose if checks["定位和地图一致"] else None
@@ -240,6 +248,8 @@ def main(args=None):
         parser.error("采样时间必须是有限正数")
     position_limit = arguments.start_position_tolerance_m
     heading_limit = arguments.start_heading_tolerance_deg
+    if not arguments.simulation and (position_limit is None or heading_limit is None):
+        parser.error("真机预检必须指定 --start-position-tolerance-m 和 --start-heading-tolerance-deg")
     if position_limit is not None and (not math.isfinite(position_limit) or position_limit < 0):
         parser.error("起点位置限值必须是有限的非负数")
     if heading_limit is not None and not 0 <= heading_limit <= 180:

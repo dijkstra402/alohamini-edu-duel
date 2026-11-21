@@ -60,7 +60,8 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
         assert vehicle["起点朝向偏差_deg"] <= 20
     assert checks["断联停稳"]["记录完整"]
     marked = checks["断联停稳"]
-    assert marked["通过"] and marked["0.5秒内停稳"]
+    assert marked["通过"] and marked["0.5秒内停稳"] and marked["可用于0.5秒验收"]
+    assert marked["双车"]["sword_a"]["故障前轮速显示运动"]
     assert marked["故障标记"]["来源"] == "仿真 UDP 转发器双向断开"
     marker = json.loads((output / "stop_watch_event.json").read_text(encoding="utf-8"))
     assert marked["故障标记"]["单调时间_ns"] == marker["triggered_ns"]
@@ -75,6 +76,8 @@ def test_full_simulation_fault_and_recovery(tmp_path, use_nav2, duel_package_loo
     assert all(0 < value <= 0.5 for value in timed["双车检测断联_s"].values())
     assert checks["断联时雷达仍更新"]
     assert checks["重连"]
+    assert set(checks["重连后两路输入下保持禁用和零速"]) == {"73", "74"}
+    assert all(count >= 3 for count in checks["重连后两路输入下保持禁用和零速"].values())
     assert checks["有序停机"]
     assert all(scan["unexpected"] > 0 for scan in checks["雷达差分"].values())
     assert checks["电子判分"]["scores"] == {"sword_a": 0, "shield_b": int(use_nav2)}

@@ -15,6 +15,7 @@ from builtin_interfaces.msg import Time as TimeMsg
 from control_msgs.msg import JointJog
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import Twist, TwistStamped, TwistWithCovarianceStamped
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -157,7 +158,6 @@ class AlohaMiniBridge(Node):
             "wheel_velocity_variance_yaw": 0.09,
             "base_frame": "base_link",
             "max_clock_offset_ms": 250.0,
-            "command_timeout_sec": 0.5,
             "cmd_vel_topic": "/cmd_vel",
             "max_linear_speed": 0.25,
             "max_lateral_speed": 0.25,
@@ -188,6 +188,7 @@ class AlohaMiniBridge(Node):
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
+        self.declare_parameter("command_timeout_sec", 0.5, ParameterDescriptor(read_only=True))
 
         def parameter(name):
             return self.get_parameter(name).value

@@ -20,6 +20,7 @@ def _nodes(context):
         state_timestamp_mode=value("state_timestamp_mode"),
         observation_port=value("observation_port"),
         command_port=value("command_port"),
+        command_timeout_sec=value("command_timeout_sec"),
         collision_params=value("collision_params"),
         ekf_params=value("ekf_params"),
         runtime_mode=value("runtime_mode"),

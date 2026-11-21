@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from alohamini_duel.fault_event import FaultEvent
@@ -120,5 +121,48 @@ def test_fault_timing_keeps_wheel_stop_observed_before_link_edge():
 def test_missing_fault_marker_is_not_treated_as_pass():
     report = {"记录完整": True, "断联前观察到运动": True, "双车": {}}
     assert not mark_report(report, {}, None, None, 2.0)
+    assert report["可用于0.5秒验收"] is False
     assert report["0.5秒内停稳"] is None
     assert report["失败原因"] == "未获得故障触发标记"
+
+
+@pytest.mark.parametrize("motion_returns_after_fault", [False, True])
+def test_marked_report_rejects_cars_already_stationary_at_fault(motion_returns_after_fault):
+    observations = {robot: StopObservation() for robot in ("sword_a", "shield_b")}
+    for item in observations.values():
+        item.observe_status(VehicleStatus("现场会话", 1, POSE, True, True), 1.00)
+        item.observe_command(False, 1.00)
+        item.observe_wheel(1, False, 1.00)
+        for sequence, at in enumerate((1.02, 1.08, 1.15, 1.22, 1.29, 1.34), 2):
+            stationary = not (motion_returns_after_fault and at == 1.15)
+            item.observe_command(stationary, at)
+            item.observe_wheel(sequence, stationary, at)
+        item.observe_status(VehicleStatus("现场会话", 2, POSE, False, False), 1.35)
+        for sequence, at in enumerate((1.36, 1.37, 1.38, 1.39, 1.40), 8):
+            item.observe_wheel(sequence, True, at)
+
+    now = 1.40
+    cars = {robot: item.results(1.00, now) for robot, item in observations.items()}
+    assert all(car["记录完整"] and car["断联前轮速显示运动"] for car in cars.values())
+    report = {"记录完整": True, "断联前观察到运动": True, "双车": cars}
+    event = FaultEvent(1_100_000_000, "现场触发器")
+    assert not mark_report(report, observations, event, None, now)
+    assert report["失败原因"] == "故障触发时刻未观察到运动"
+    assert report["可用于0.5秒验收"] is False
+    assert all(car["故障时已观测静止"] for car in cars.values())
+
+
+def test_unmarked_cli_report_is_ineligible_for_half_second_acceptance(tmp_path, capsys):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_duel.stop_watch import main
+
+    map_path = tmp_path / "map.yaml"
+    map_path.write_text("image: map.pgm\n")
+    (tmp_path / "map.pgm").write_bytes(b"P5\n1 1\n255\n\0")
+    arena = Path(__file__).parents[1] / "config/arena_example.yaml"
+    result = main([
+        "--arena", str(arena), "--map", str(map_path), "--domains", "94", "95",
+        "--duration", "0.01", "--simulation",
+    ])
+    assert result == 1
+    assert json.loads(capsys.readouterr().out)["可用于0.5秒验收"] is False

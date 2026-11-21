@@ -128,6 +128,7 @@ def runtime_defaults():
         state_timestamp_mode="host_wall",
         observation_port="5556",
         command_port="5555",
+        command_timeout_sec="",
         collision_params="",
         ekf_params="",
         runtime_mode="hardware",
@@ -150,6 +151,7 @@ def runtime(
     state_timestamp_mode="host_wall",
     observation_port="5556",
     command_port="5555",
+    command_timeout_sec="",
     collision_params="",
     ekf_params="",
     runtime_mode="hardware",
@@ -191,6 +193,7 @@ def runtime(
                 cmd_vel_topic="/cmd_vel_safe",
                 observation_port=observation_port,
                 command_port=command_port,
+                command_timeout_sec=command_timeout_sec,
             )
         )
     actions.append(cleanup_collision)

@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+from alohamini_duel.cmd_vel_arbiter import COMMAND_TIMEOUT
 
 
 @pytest.mark.parametrize(
@@ -64,6 +65,20 @@ def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_statu
         assert packages.count("alohamini_bridge") == 1
         assert by_executable["bridge_node"]["base_only"] is True
         assert by_executable["bridge_node"]["cmd_vel_topic"] == "/cmd_vel_safe"
+        assert by_executable["bridge_node"]["command_timeout_sec"] == COMMAND_TIMEOUT == 0.15
+        if referee_status is None:
+            standalone, _ = helpers.launch_graph("alohamini_navigation", "runtime.launch.py")
+            assert next(params for _, node, params in standalone if node == "bridge_node")[
+                "command_timeout_sec"
+            ] == 0.5
+            params_file = tmp_path / "bridge.yaml"
+            params_file.write_text(
+                "alohamini_lerobot_bridge:\n  ros__parameters:\n    command_timeout_sec: 0.4\n"
+            )
+            custom, _ = helpers.launch_graph(
+                "alohamini_bridge", "bridge.launch.py", params_file=str(params_file)
+            )
+            assert custom[0][2]["command_timeout_sec"] == 0.4
     assert by_executable["collision_monitor"]["cmd_vel_in_topic"] == "/cmd_vel"
     assert by_executable["collision_monitor"]["cmd_vel_out_topic"] == "/cmd_vel_safe"
     assert by_executable["amcl"]["set_initial_pose"] is True

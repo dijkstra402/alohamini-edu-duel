@@ -265,13 +265,16 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         def stationary():
             return all(wheel_is_stationary(truth(domain).twist.twist) for domain in domains)
 
-        def switch(topic, enabled, index=0):
+        def switch(topic, enabled, index=0, *, expected=True):
             client = nodes[index].create_client(SetBool, topic)
             try:
                 wait_for(client.service_is_ready, 5, f"未发现仿真服务 {topic}")
                 request = client.call_async(SetBool.Request(data=enabled))
                 wait_for(request.done, 5, f"仿真服务调用超时 {topic}")
-                require(request.result().success, f"仿真服务拒绝请求 {topic}")
+                require(
+                    request.result().success == expected,
+                    f"仿真服务 {topic} 返回异常。{request.result().message}",
+                )
             finally:
                 nodes[index].destroy_client(client)
 
@@ -434,15 +437,12 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             results["固定航点终点"] = [position.x, position.y]
             results["固定航点平面误差_m"] = goal_distance(domains[0], goal)
 
-        velocity = [
-            node.create_publisher(Twist, "/cmd_vel_duel", 1)
-            for node in (nodes[:1] if use_nav2 else nodes)
-        ]
+        velocity = [node.create_publisher(Twist, "/cmd_vel_duel", 1) for node in nodes]
         move = Twist()
         move.linear.x = 0.1
 
         def drive():
-            for publisher in velocity:
+            for publisher in (velocity[:1] if use_nav2 else velocity):
                 publisher.publish(move)
 
         missed_deadlines = []
@@ -550,7 +550,7 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
         )
         require(
             evidence.get("故障标记", {}).get("单调时间_ns") == injected_ns
-            and evidence.get("0.5秒内停稳") is not None,
+            and evidence.get("可用于0.5秒验收") is True,
             evidence.get("失败原因", "带故障标记的轮速记录不完整"),
         )
         if not evidence["0.5秒内停稳"]:
@@ -577,14 +577,62 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             4, "断联后雷达诊断未继续更新",
         )
         results["断联时雷达仍更新"] = True
+        enable_service = "/alohamini_duel_base/command_enable"
+        status_topic = "/duel/local_status"
+        for index in range(len(nodes)):
+            switch(enable_service, True, index, expected=False)
+
+        outputs = {domain: [] for domain in domains}
+        subscriptions = [
+            node.create_subscription(Twist, "/cmd_vel", outputs[domain].append, 10)
+            for node, domain in zip(nodes, domains, strict=True)
+        ]
+        continued_inputs = velocity + [
+            node.create_publisher(Twist, "/cmd_vel_nav_out", 1) for node in nodes
+        ]
+
+        def drive_both_sources():
+            for publisher in continued_inputs:
+                publisher.publish(move)
+
+        wait_for(
+            lambda: all(publisher.get_subscription_count() > 0 for publisher in continued_inputs)
+            and all(outputs.values()),
+            5, "重连回归缺少速度输入或仲裁输出连接",
+        )
         link.set_mode("normal")
-        wait_for(recovered, 8, "重连后双车未重新上线")
-        if use_nav2:
-            stopped_at = time.monotonic()
-            wait_for(sustained_stop, 2, "重连后被取消的任务恢复运动")
+        wait_for(recovered, 8, "重连后双车未重新上线", drive_both_sources)
+        stopped_at = time.monotonic()
+        prior_counts = {domain: len(samples) for domain, samples in outputs.items()}
+
+        def still_disabled():
+            require(
+                all(
+                    read_json(domain, status_topic).get("motion_enabled") is False
+                    for domain in domains
+                ),
+                "重连后仲裁在重新请求前恢复使能",
+            )
+            return sustained_stop() and all(
+                len(samples) - prior_counts[domain] >= 3 for domain, samples in outputs.items()
+            )
+
+        wait_for(still_disabled, 2, "重连后缺少连续零速采样", drive_both_sources)
+        zero = Twist()
+        require(
+            all(sample == zero for samples in outputs.values() for sample in samples),
+            "持续非零输入下重连产生了非零仲裁速度",
+        )
+        results["重连后两路输入下保持禁用和零速"] = {
+            str(domain): len(outputs[domain]) - prior_counts[domain] for domain in domains
+        }
+        for node, subscription in zip(nodes, subscriptions, strict=True):
+            node.destroy_subscription(subscription)
         results["重连"] = True
 
         if not use_nav2:
+            for index in range(len(nodes)):
+                switch(enable_service, True, index)
             fault_report = {}
             results["扩展网络故障"] = fault_report
             link.set_mode("loss")
@@ -613,8 +661,9 @@ def run_acceptance(output, domains, use_nav2, full_round, results):
             fault_report["单向延迟"] = {"延迟_s": DELAY_S, **delay, **link.snapshot()}
             link.set_mode("normal")
             wait_for(recovered, 8, "移除延迟后双车未重新上线")
+            for index in range(len(nodes)):
+                switch(enable_service, True, index)
 
-            status_topic = "/duel/local_status"
             sessions = [read_json(domain, status_topic)["session_id"] for domain in domains]
             wait_for(moving, 5, "进程退出前双车未移动", drive)
             start_timing(time.monotonic_ns())

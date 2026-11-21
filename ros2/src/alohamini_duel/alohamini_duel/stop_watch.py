@@ -5,7 +5,7 @@ import math
 import sys
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .arena import ROBOT_IDS, Arena
@@ -35,6 +35,8 @@ class StopObservation:
     stopped_count: int = 0
     moved_before_edge: bool = False
     interrupted: bool = False
+    # 故障标记可能晚于轮速回调到达，按标记时间回查最后一帧反馈。
+    wheel_history: list[tuple[float, bool | None]] = field(default_factory=list)
 
     def observe_status(self, status: VehicleStatus, now: float):
         previous = self.status
@@ -71,12 +73,14 @@ class StopObservation:
 
     def observe_wheel(self, stamp: int | None, stationary: bool, now: float):
         if stamp is None:
+            self.wheel_history.append((now, None))
             self.stopped_count, self.stopped_at = 0, None
             self.stationary_since = None
             self.wheel_at = -math.inf
             return
         if stamp <= self.last_wheel_stamp:
             return
+        self.wheel_history.append((now, stationary))
         if not stationary:
             self.last_moving_at = now
         if now - self.wheel_at > WHEEL_TIMEOUT or not stationary:
@@ -120,16 +124,23 @@ class StopObservation:
         triggered = event.triggered_at
         if not self.completed(now) or self.edge < triggered:
             return None
+        last_wheel_at, was_stationary = next(
+            ((at, stopped) for at, stopped in reversed(self.wheel_history) if at <= triggered),
+            (-math.inf, None),
+        )
+        fresh_wheel = triggered - last_wheel_at <= WHEEL_TIMEOUT
         return {
             "故障到检测断联_s": self.edge - triggered,
             "故障到观测零速_s": max(self.zero_since - triggered, 0.0),
             "故障到轮速停稳_s": max(self.stationary_since - triggered, 0.0),
             "故障到停稳确认_s": self.stopped_at - triggered,
-            "故障时已观测静止": self.stationary_since < triggered,
+            "故障时已观测静止": fresh_wheel and was_stationary is True,
+            "故障前轮速显示运动": fresh_wheel and was_stationary is False,
         }
 
 
 def mark_report(report, observations, event, marker_error, now):
+    report["可用于0.5秒验收"] = False
     report["0.5秒内停稳"] = None
     if event is None:
         report["失败原因"] = marker_error or "未获得故障触发标记"
@@ -145,11 +156,15 @@ def mark_report(report, observations, event, marker_error, now):
     if any(timing is None for timing in timings.values()):
         report["失败原因"] = "故障标记时间晚于联机下降沿"
         return False
+    if not any(timing["故障前轮速显示运动"] for timing in timings.values()):
+        report["失败原因"] = "故障触发时刻未观察到运动"
+        return False
     if not report["断联前观察到运动"]:
         report["失败原因"] = "故障前未观察到运动"
         return False
     worst = max(timing["故障到轮速停稳_s"] for timing in timings.values())
     report["最迟轮速停稳_s"] = worst
+    report["可用于0.5秒验收"] = True
     report["0.5秒内停稳"] = worst <= STOP_DEADLINE_S
     if not report["0.5秒内停稳"]:
         report["失败原因"] = "最迟轮速停稳超过 0.5 秒"
@@ -256,7 +271,10 @@ def main(args=None):
         }
     complete = all(item["记录完整"] for item in results.values())
     motion_observed = any(item["断联前轮速显示运动"] for item in results.values())
-    report = {"记录完整": complete, "断联前观察到运动": motion_observed, "双车": results}
+    report = {
+        "记录完整": complete, "断联前观察到运动": motion_observed,
+        "可用于0.5秒验收": False, "双车": results,
+    }
     report["通过"] = (
         mark_report(report, observations, event, marker_error, now)
         if marker is not None else complete and motion_observed
