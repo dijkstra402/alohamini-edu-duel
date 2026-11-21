@@ -2,6 +2,7 @@ import json
 import math
 import select
 import socket
+import time
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
@@ -103,7 +104,7 @@ def test_preflight_start_limits_require_recent_samples_in_the_same_session(arena
         context.init(args=[], domain_id=92)
         resources.callback(context.try_shutdown)
         node = VehicleCheck(
-            context, arena, robot, True, position_limit=0.10, heading_limit=3.0
+            context, arena, robot, False, position_limit=0.10, heading_limit=3.0
         )
         resources.callback(node.destroy_node)
         for sequence in (1, 2, 3):
@@ -135,13 +136,29 @@ def test_preflight_start_limits_require_recent_samples_in_the_same_session(arena
         assert node.results(None, None)["距标定起点_m"] is None
 
 
-def test_preflight_rejects_bridge_topic_remapped_away_from_monitor(arena):
+@pytest.mark.parametrize("limits", [
+    [],
+    ["--start-position-tolerance-m", "0.1"],
+    ["--start-heading-tolerance-deg", "5"],
+])
+def test_hardware_preflight_requires_both_start_limits(limits, capsys):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_duel.preflight import main
+
+    with pytest.raises(SystemExit) as error:
+        main(["--arena", "场地.yaml", "--map", "地图.yaml", *limits])
+    assert error.value.code == 2
+    assert "真机预检必须指定" in capsys.readouterr().err
+
+
+def test_preflight_rejects_legacy_bridge_and_invalid_watchdog(arena):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+    from rcl_interfaces.srv import GetParameters
     from rclpy.context import Context
-    from rclpy.node import Node
+    from rclpy.parameter import Parameter
 
-    from alohamini_duel.preflight import BRIDGE_TOPIC_CHECK, VehicleCheck
+    from alohamini_duel.preflight import BRIDGE_TIMEOUT_CHECK, BRIDGE_TOPIC_CHECK, VehicleCheck
 
     with ExitStack() as resources:
         context = Context()
@@ -149,11 +166,6 @@ def test_preflight_rejects_bridge_topic_remapped_away_from_monitor(arena):
         resources.callback(context.try_shutdown)
         node = VehicleCheck(context, arena, ROBOT_IDS[0], False)
         resources.callback(node.destroy_node)
-        bridge = Node(
-            "preflight_bridge_test", context=context,
-            cli_args=["--ros-args", "-r", "/cmd_vel_safe:=/different_topic"],
-        )
-        resources.callback(bridge.destroy_node)
         status = DiagnosticStatus(
             name="AlohaMini Host state bridge",
             level=DiagnosticStatus.OK,
@@ -161,18 +173,80 @@ def test_preflight_rejects_bridge_topic_remapped_away_from_monitor(arena):
                 KeyValue(key="host_robot_model", value="alohamini2edu"),
                 KeyValue(key="command_enabled", value="false"),
                 KeyValue(key="stop_pending", value="false"),
-                KeyValue(key="resolved_cmd_vel_topic", value="/cmd_vel_safe"),
             ],
         )
         message = DiagnosticArray(status=[status])
         node.on_diagnostics(message)
         node.on_diagnostics(message)
-        assert node.results(None, None)["检查"][BRIDGE_TOPIC_CHECK]
-        status.values[-1].value = bridge.resolve_topic_name("/cmd_vel_safe")
-        node.on_diagnostics(message)
-        report = node.results(None, None)
-        assert report["桥接解析后速度入口"] == "/different_topic"
-        assert not report["检查"][BRIDGE_TOPIC_CHECK]
+        checks = node.results(None, None)["检查"]
+        assert checks["真机桥接健康且未使能"]
+        assert not checks[BRIDGE_TOPIC_CHECK]
+        assert not checks[BRIDGE_TIMEOUT_CHECK]
+
+        values = [
+            Parameter("base_only", value=True).get_parameter_value(),
+            Parameter("cmd_vel_topic", value="/cmd_vel_safe").get_parameter_value(),
+        ]
+        for timeout, expected in [
+            (None, False), (0.15, True), (0.5, False), (0.0, False),
+            (float("nan"), False), ("0.15", False),
+        ]:
+            response = GetParameters.Response(
+                values=values + [Parameter("command_timeout_sec", value=timeout).get_parameter_value()]
+            )
+            assert node.results(None, response)["检查"][BRIDGE_TIMEOUT_CHECK] is expected
+
+
+@pytest.mark.parametrize("resolved", ["/cmd_vel_safe", "/cmd_vel"])
+def test_preflight_reads_real_bridge_parameters_and_resolved_topic(arena, resolved):
+    pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_bridge.bridge_node import AlohaMiniBridge
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.parameter import Parameter
+
+    from alohamini_duel.preflight import BRIDGE_TIMEOUT_CHECK, BRIDGE_TOPIC_CHECK, VehicleCheck
+
+    with ExitStack() as resources:
+        context = Context()
+        context.init(args=[], domain_id=92)
+        resources.callback(context.try_shutdown)
+        node = VehicleCheck(context, arena, ROBOT_IDS[0], False)
+        resources.callback(node.destroy_node)
+        bridge = AlohaMiniBridge(
+            context=context,
+            parameter_overrides=[
+                Parameter("base_only", value=True),
+                Parameter("expected_robot_model", value="alohamini2edu"),
+                Parameter("cmd_vel_topic", value="/cmd_vel_safe"),
+                Parameter("command_timeout_sec", value=0.15),
+            ],
+            cli_args=[] if resolved == "/cmd_vel_safe" else [
+                "--ros-args", "-r", "/cmd_vel_safe:=/cmd_vel",
+            ],
+        )
+        resources.callback(bridge.destroy_node)
+        executor = SingleThreadedExecutor(context=context)
+        resources.callback(executor.shutdown)
+        executor.add_node(bridge)
+        executor.add_node(node)
+        assert node.bridge_params.wait_for_service(timeout_sec=3)
+        _, pending = node.read_services()
+        executor.spin_until_future_complete(pending, timeout_sec=3)
+        assert pending.done()
+        assert not bridge.set_parameters([Parameter("command_timeout_sec", value=0.5)])[0].successful
+        expected = resolved == "/cmd_vel_safe"
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.05)
+            if node.resolved_bridge_topic == resolved and (
+                not expected or node.recent(BRIDGE_TOPIC_CHECK, count=2, max_age=1.5)
+            ):
+                break
+        report = node.results(None, pending.result())
+        assert report["桥接解析后速度入口"] == resolved
+        assert report["检查"][BRIDGE_TOPIC_CHECK] is expected
+        assert report["检查"][BRIDGE_TIMEOUT_CHECK]
 
 
 def test_fixed_route_loads_map_poses_and_rejects_outside_footprints(arena, tmp_path):
@@ -272,7 +346,8 @@ def test_udp_socket_receives_only_the_configured_peer(arena):
             assert a.remote.pose == POSE_B
 
 
-def test_heartbeat_tick_acknowledges_packet_already_in_socket(arena, tmp_path):
+@pytest.fixture
+def udp_duel_base(arena, tmp_path):
     rclpy = pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
     from geometry_msgs.msg import TransformStamped
     from nav_msgs.msg import Odometry
@@ -298,23 +373,78 @@ def test_heartbeat_tick_acknowledges_packet_already_in_socket(arena, tmp_path):
         resources.callback(rclpy.try_shutdown)
         base = DuelBase()
         resources.callback(base.destroy_node)
-        stamp = base.get_clock().now().to_msg()
         transform = TransformStamped()
         transform.header.frame_id, transform.child_frame_id = "map", "base_link"
-        transform.header.stamp = stamp
         transform.transform.translation.x, transform.transform.translation.y = POSE_A[:2]
         transform.transform.rotation.w = 1.0
-        base.tf.set_transform(transform, "心跳测试")
         odometry = Odometry()
-        odometry.header.stamp = stamp
-        base._odom(odometry)
-        peer = PeerLink(ROBOT_IDS[1], arena)
-        remote.sendto(peer.encode(POSE_B, 0.0, 0.0, 1.0), base.udp.getsockname())
+
+        def refresh_pose():
+            transform.header.stamp = odometry.header.stamp = base.get_clock().now().to_msg()
+            base.tf.set_transform(transform, "心跳测试")
+            base._odom(odometry)
+
+        refresh_pose()
+        yield base, remote, refresh_pose
+
+
+def test_heartbeat_tick_acknowledges_packet_already_in_socket(arena, udp_duel_base):
+    base, remote, _ = udp_duel_base
+    peer = PeerLink(ROBOT_IDS[1], arena)
+    remote.sendto(peer.encode(POSE_B, 0.0, 0.0, 1.0), base.udp.getsockname())
+    assert select.select([base.udp], [], [], 1)[0]
+    base._tick()
+    heartbeat = json.loads(remote.recv(1024))
+    assert heartbeat["ack_session_id"] == peer.session_id
+    assert heartbeat["ack_seq"] == peer.seq
+
+
+@pytest.mark.parametrize(("source", "lose_pose"), [("duel", False), ("nav", True)])
+def test_base_revokes_motion_permission_until_explicit_reenable(
+    arena, udp_duel_base, source, lose_pose,
+):
+    from geometry_msgs.msg import Twist
+    from std_srvs.srv import SetBool
+
+    base, remote, refresh_pose = udp_duel_base
+    peer = PeerLink(ROBOT_IDS[1], arena)
+    request = SetBool.Request(data=True)
+    move = Twist()
+    move.linear.x = 0.06
+
+    def exchange_with_base():
+        refresh_pose()
+        remote.sendto(peer.encode(POSE_B, 0.0, 0.0, time.monotonic()), base.udp.getsockname())
         assert select.select([base.udp], [], [], 1)[0]
         base._tick()
-        heartbeat = json.loads(remote.recv(1024))
-        assert heartbeat["ack_session_id"] == peer.session_id
-        assert heartbeat["ack_seq"] == peer.seq
+        peer.accept(remote.recv(1024), time.monotonic())
+
+    assert not base._enable(request, SetBool.Response()).success
+    for _ in range(5):
+        exchange_with_base()
+    assert base.online and base._enable(request, SetBool.Response()).success
+    base._command(source, move)
+    assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) != STOP
+
+    if lose_pose:
+        base.odometry = None
+    if not lose_pose:
+        base.link.acked_sent_at = -math.inf
+    assert not base._enable(request, SetBool.Response()).success
+    base._tick()
+    if not lose_pose:
+        peer.accept(remote.recv(1024), time.monotonic())
+    assert not base.online and not base.arbiter.enabled
+
+    for _ in range(5):
+        base._command(source, move)
+        exchange_with_base()
+        assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) == STOP
+    assert base.online and not base.arbiter.enabled
+    assert base._enable(request, SetBool.Response()).success
+    assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) == STOP
+    base._command(source, move)
+    assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) != STOP
 
 
 def test_arbitration_priority_timeout_and_stop_recovery(arena):

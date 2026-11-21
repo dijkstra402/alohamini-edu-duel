@@ -1195,6 +1195,7 @@ def test_ros_service_and_cmd_vel_use_native_client_and_stop_on_shutdown(ros, hos
         parameter_overrides=[
             Parameter("observation_port", value=port),
             Parameter("command_port", value=state["command_port"]),
+            Parameter("command_timeout_sec", value=0.15),
         ]
     )
     operator = Node("base_command_test_operator")
@@ -1204,8 +1205,8 @@ def test_ros_service_and_cmd_vel_use_native_client_and_stop_on_shutdown(ros, hos
     service = operator.create_client(SetBool, "/alohamini_lerobot_bridge/command_enable")
     publisher = operator.create_publisher(Twist, "/cmd_vel", 1)
 
-    def until(predicate):
-        deadline = time.monotonic() + 3
+    def until(predicate, timeout=3):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():
                 return
@@ -1229,6 +1230,8 @@ def test_ros_service_and_cmd_vel_use_native_client_and_stop_on_shutdown(ros, hos
         assert command["x.vel"] == 0.1
         assert command["theta.vel"] == math.degrees(0.5)
         assert set(command) == {"x.vel", "y.vel", "theta.vel", "_command"}
+        until(lambda: state["commands"][-1]["x.vel"] == 0.0, timeout=0.45)
+        assert node.commands.status()[0]
         disabled = service.call_async(SetBool.Request(data=False))
         until(disabled.done)
         assert disabled.result().success

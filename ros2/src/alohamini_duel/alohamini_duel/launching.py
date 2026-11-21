@@ -11,6 +11,7 @@ from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
 
 from .arena import ROBOT_IDS, Arena
+from .cmd_vel_arbiter import COMMAND_TIMEOUT
 
 
 def _nodes(context, *, simulation):
@@ -44,6 +45,7 @@ def _nodes(context, *, simulation):
             use_rviz=value("use_rviz"),
             base_only="true",
             runtime_mode="simulation" if simulation else "hardware",
+            command_timeout_sec="" if simulation else str(COMMAND_TIMEOUT),
             use_sim_time=str(simulation).lower(),
         ),
         Node(

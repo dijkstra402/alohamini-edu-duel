@@ -31,7 +31,6 @@ def main(args=None):
     from nav2_msgs.action import NavigateThroughPoses
     from rclpy.action import ActionClient
     from rclpy.parameter import Parameter
-    from rclpy.qos import qos_profile_sensor_data
     from rclpy.signals import SignalHandlerOptions
     from rclpy.utilities import remove_ros_args
     from std_msgs.msg import String
@@ -84,7 +83,7 @@ def main(args=None):
     def ready():
         return can_move() and client.server_is_ready() and node.get_clock().now().nanoseconds > 0
 
-    node.create_subscription(String, "/duel/local_status", observe, qos_profile_sensor_data)
+    node.create_subscription(String, "/duel/local_status", observe, 1)
     try:
         while time.monotonic() < deadline and not ready():
             rclpy.spin_once(node, timeout_sec=0.05)
