@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from .arena import Arena, Pose, coordinates
 
 MAX_POSE_AGE = 0.35
+MAX_SCAN_AGE = 0.30
+SCAN_TIMEOUT = 0.21
 
 
 def fresh_stamp(header, frame, now_ns, max_age):
@@ -14,6 +16,13 @@ def fresh_stamp(header, frame, now_ns, max_age):
     if header.frame_id == frame and stamp_ns > 0 and -0.05 <= (now_ns - stamp_ns) / 1e9 <= max_age:
         return stamp_ns
     return None
+
+
+def scan_has_valid_ranges(scan):
+    return sum(
+        math.isfinite(value) and scan.range_min <= value <= scan.range_max
+        for value in scan.ranges
+    ) > 10
 
 
 def wheel_is_stationary(twist):

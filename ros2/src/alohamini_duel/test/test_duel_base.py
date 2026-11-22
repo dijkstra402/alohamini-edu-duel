@@ -483,6 +483,26 @@ def test_heartbeat_tick_acknowledges_latest_packet_already_in_socket(arena, udp_
     assert heartbeat["ack_seq"] == peer.seq
 
 
+def exchange_with_base(base, remote, refresh_pose, peer):
+    refresh_pose()
+    remote.sendto(peer.encode(POSE_B, 0.0, 0.0, time.monotonic()), base.udp.getsockname())
+    assert select.select([base.udp], [], [], 1)[0]
+    base._tick()
+    peer.accept(remote.recv(1024), time.monotonic())
+
+
+def scan_sample(base, *, age=0.0, points=11):
+    from rclpy.time import Time
+    from sensor_msgs.msg import LaserScan
+
+    message = LaserScan(range_min=0.15, range_max=8.0, ranges=[1.0] * points)
+    message.header.frame_id = "laser_frame"
+    message.header.stamp = Time(
+        nanoseconds=base.get_clock().now().nanoseconds - round(age * 1e9)
+    ).to_msg()
+    return message
+
+
 @pytest.mark.parametrize(("source", "lose_pose"), [("duel", False), ("nav", True)])
 def test_base_revokes_motion_permission_until_explicit_reenable(
     arena, udp_duel_base, source, lose_pose,
@@ -496,16 +516,10 @@ def test_base_revokes_motion_permission_until_explicit_reenable(
     move = Twist()
     move.linear.x = 0.06
 
-    def exchange_with_base():
-        refresh_pose()
-        remote.sendto(peer.encode(POSE_B, 0.0, 0.0, time.monotonic()), base.udp.getsockname())
-        assert select.select([base.udp], [], [], 1)[0]
-        base._tick()
-        peer.accept(remote.recv(1024), time.monotonic())
-
+    base._scan(scan_sample(base))
     assert not base._enable(request, SetBool.Response()).success
     for _ in range(5):
-        exchange_with_base()
+        exchange_with_base(base, remote, refresh_pose, peer)
     assert base.online and base._enable(request, SetBool.Response()).success
     base._command(source, move)
     assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) != STOP
@@ -522,13 +536,90 @@ def test_base_revokes_motion_permission_until_explicit_reenable(
 
     for _ in range(5):
         base._command(source, move)
-        exchange_with_base()
+        exchange_with_base(base, remote, refresh_pose, peer)
         assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) == STOP
     assert base.online and not base.arbiter.enabled
     assert base._enable(request, SetBool.Response()).success
     assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) == STOP
     base._command(source, move)
     assert base.arbiter.select(POSE_A, base.link.remote, time.monotonic()) != STOP
+
+
+@pytest.mark.parametrize(
+    ("source", "fault"),
+    [("duel", "停止到包"), ("nav", "旧时戳"), ("nav", "有效回波不足")],
+)
+def test_base_requires_fresh_scan_and_revokes_motion(arena, udp_duel_base, source, fault):
+    import rclpy
+    from geometry_msgs.msg import Twist
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import LaserScan
+    from std_srvs.srv import SetBool
+
+    base, remote, refresh_pose = udp_duel_base
+    peer = PeerLink(ROBOT_IDS[1], arena)
+    enable = SetBool.Request(data=True)
+    for _ in range(5):
+        exchange_with_base(base, remote, refresh_pose, peer)
+    assert base.online
+    assert not base._enable(enable, SetBool.Response()).success
+
+    for timer in base.timers:
+        timer.cancel()
+    with ExitStack() as resources:
+        probe = rclpy.create_node("duel_scan_guard_probe", use_global_arguments=False)
+        resources.callback(probe.destroy_node)
+        publisher = probe.create_publisher(LaserScan, "/scan_filtered", qos_profile_sensor_data)
+        outputs = []
+        probe.create_subscription(Twist, "/cmd_vel", outputs.append, 1)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and (
+            not publisher.get_subscription_count() or not base.velocity_pub.get_subscription_count()
+        ):
+            rclpy.spin_once(probe, timeout_sec=0.01)
+        assert publisher.get_subscription_count() == 1
+        assert base.velocity_pub.get_subscription_count() == 1
+
+        def publish_scan(age=0.0, points=11):
+            publisher.publish(scan_sample(base, age=age, points=points))
+            rclpy.spin_once(base, timeout_sec=0.1)
+
+        def check_output(speed):
+            outputs.clear()
+            exchange_with_base(base, remote, refresh_pose, peer)
+            deadline = time.monotonic() + 0.1
+            while time.monotonic() < deadline and not outputs:
+                rclpy.spin_once(probe, timeout_sec=0.01)
+            assert outputs and outputs[-1].linear.x == pytest.approx(speed)
+            assert base.online
+
+        publish_scan(age=0.14)
+        exchange_with_base(base, remote, refresh_pose, peer)
+        assert base._enable(enable, SetBool.Response()).success
+        move = Twist()
+        move.linear.x = 0.06
+        base._command(source, move)
+        check_output(0.06)
+
+        if fault == "停止到包":
+            header, _ = base.scan
+            base.scan = header, time.monotonic() - 0.22
+        if fault == "旧时戳":
+            publish_scan(age=0.31)
+        if fault == "有效回波不足":
+            publish_scan(points=10)
+        base._command(source, move)
+        check_output(0.0)
+        assert not base.arbiter.enabled
+        assert not base._enable(enable, SetBool.Response()).success
+
+        publish_scan()
+        base._command(source, move)
+        check_output(0.0)
+        assert base._enable(enable, SetBool.Response()).success
+        check_output(0.0)
+        base._command(source, move)
+        check_output(0.06)
 
 
 def test_arbitration_priority_timeout_and_stop_recovery(arena):

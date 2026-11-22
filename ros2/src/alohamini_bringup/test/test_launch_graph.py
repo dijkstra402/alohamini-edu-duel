@@ -35,9 +35,12 @@ def launch_graph(package, filename, *, details=None, **arguments):
             return
         if isinstance(entity, Node):
             parameters = {}
+            parameter_documents = []
             for item in evaluate_parameters(context, entity._Node__parameters or []):
                 if isinstance(item, Path):
-                    for config in yaml.safe_load(item.read_text()).values():
+                    document = yaml.safe_load(item.read_text())
+                    parameter_documents.append(document)
+                    for config in document.values():
                         parameters.update(config.get("ros__parameters", {}))
                 else:
                     parameters.update(item)
@@ -47,6 +50,7 @@ def launch_graph(package, filename, *, details=None, **arguments):
                     dict(
                         package=text(entity.node_package),
                         namespace=text(entity._Node__node_namespace or ""),
+                        parameter_documents=parameter_documents,
                         remappings={text(k): text(v) for k, v in entity._Node__remappings or []},
                         arguments=[text(arg) for arg in entity._Node__arguments or []],
                     )

@@ -25,7 +25,16 @@ from std_msgs.msg import String
 from .arena import BASE_RADIUS, ROBOT_IDS, Arena, coordinates
 from .cmd_vel_arbiter import COMMAND_TIMEOUT
 from .ros_domains import attach_domain, dual_domain_parser, parse_dual_domain_args
-from .status import VehicleStatus, angle_error, fresh_stamp, wheel_is_stationary, yaw_from_quaternion
+from .status import (
+    MAX_SCAN_AGE,
+    SCAN_TIMEOUT,
+    VehicleStatus,
+    angle_error,
+    fresh_stamp,
+    scan_has_valid_ranges,
+    wheel_is_stationary,
+    yaw_from_quaternion,
+)
 
 BRIDGE = "alohamini_lerobot_bridge"
 ARBITER = "alohamini_duel_base"
@@ -172,11 +181,12 @@ class VehicleCheck(Node):
         )
 
     def on_scan(self, message):
-        valid = sum(
-            math.isfinite(value) and message.range_min <= value <= message.range_max
-            for value in message.ranges
+        self.record(
+            "新鲜雷达",
+            self.current_stamp(message.header, "laser_frame", MAX_SCAN_AGE)
+            and scan_has_valid_ranges(message),
+            max_gap=SCAN_TIMEOUT,
         )
-        self.record("新鲜雷达", self.current_stamp(message.header, "laser_frame") and valid > 10)
 
     def on_imu(self, message):
         valid = self.current_stamp(message.header, "imu_link")
@@ -227,10 +237,11 @@ class VehicleCheck(Node):
         checks = {
             name: self.recent(name)
             for name in (
-                "定位和地图一致", "双向心跳", "仲裁未使能", "新鲜雷达", "新鲜惯导",
+                "定位和地图一致", "双向心跳", "仲裁未使能", "新鲜惯导",
                 "底盘反馈静止", "仲裁输出零速", CLEARANCE_CHECK,
             )
         }
+        checks["新鲜雷达"] = self.recent("新鲜雷达", max_age=SCAN_TIMEOUT)
         cmd_publishers = [item.node_name for item in self.get_publishers_info_by_topic("/cmd_vel")]
         safe_publishers = [
             item.node_name for item in self.get_publishers_info_by_topic("/cmd_vel_safe")

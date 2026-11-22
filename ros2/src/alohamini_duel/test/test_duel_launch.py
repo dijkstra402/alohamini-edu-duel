@@ -4,15 +4,27 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import yaml
 from alohamini_duel.cmd_vel_arbiter import COMMAND_TIMEOUT
 
 
 @pytest.mark.parametrize(
-    ("simulation", "referee_status", "use_nav2"),
-    [(False, None, False), (False, "true", False), (True, None, False), (True, None, True)],
+    ("simulation", "referee_status", "use_nav2", "custom_footprint"),
+    [
+        (False, None, False, False),
+        (False, "true", False, False),
+        (False, None, True, False),
+        (False, None, True, True),
+        (True, None, False, False),
+        (True, None, True, False),
+    ],
 )
-def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_status, use_nav2):
+def test_vehicle_graph_keeps_one_speed_chain(
+    tmp_path, simulation, referee_status, use_nav2, custom_footprint,
+):
     pytest.importorskip("rclpy", reason="需要项目的 ROS 2 运行环境")
+    from alohamini_navigation.launching import model_config
+
     spec = importlib.util.spec_from_file_location(
         "duel_launch_graph",
         Path(__file__).parents[2] / "alohamini_bringup/test/test_launch_graph.py",
@@ -23,6 +35,16 @@ def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_statu
     map_file.write_text("image: map.pgm\nresolution: 0.05\norigin: [0, 0, 0]\n")
     (tmp_path / "map.pgm").write_bytes(b"P5\n1 1\n255\n\0")
     launch_options = {"referee_status": referee_status} if referee_status is not None else {}
+    costmaps = ("local_costmap", "global_costmap")
+    footprint = "[[0.30, 0.30], [0.30, -0.30], [-0.30, -0.30], [-0.30, 0.30]]"
+    if custom_footprint:
+        footprint = "[[0.36, 0.30], [0.36, -0.30], [-0.28, -0.30], [-0.28, 0.30]]"
+        settings = yaml.safe_load(Path(model_config("alohamini2edu", "nav2")).read_text())
+        for costmap in costmaps:
+            settings[costmap][costmap]["ros__parameters"]["footprint"] = footprint
+        nav2_params = tmp_path / "nav2.yaml"
+        nav2_params.write_text(yaml.safe_dump(settings), encoding="utf-8")
+        launch_options["nav2_params"] = str(nav2_params)
     details = []
     nodes, processes = helpers.launch_graph(
         "alohamini_duel",
@@ -44,6 +66,11 @@ def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_statu
     assert ("nav2_velocity_smoother" in packages) is use_nav2
     assert "nav2_waypoint_follower" not in packages
     if use_nav2:
+        for package, costmap in zip(("nav2_controller", "nav2_planner"), costmaps, strict=True):
+            node = next(item for item in details if item["package"] == package)
+            document, = node["parameter_documents"]
+            parameters = document[costmap][costmap]["ros__parameters"]
+            assert parameters["footprint"] == footprint
         smoother = next(item for item in details if item["package"] == "nav2_velocity_smoother")
         assert smoother["remappings"]["cmd_vel_smoothed"] == "/cmd_vel_nav_out"
         standalone_details = []
@@ -81,6 +108,7 @@ def test_vehicle_graph_keeps_one_speed_chain(tmp_path, simulation, referee_statu
             assert custom[0][2]["command_timeout_sec"] == 0.4
     assert by_executable["collision_monitor"]["cmd_vel_in_topic"] == "/cmd_vel"
     assert by_executable["collision_monitor"]["cmd_vel_out_topic"] == "/cmd_vel_safe"
+    assert by_executable["collision_monitor"]["source_timeout"] == 0.5
     assert by_executable["amcl"]["set_initial_pose"] is True
     assert by_executable["amcl"]["laser_model_type"] == "likelihood_field_prob"
     assert by_executable["amcl"]["do_beamskip"] is True

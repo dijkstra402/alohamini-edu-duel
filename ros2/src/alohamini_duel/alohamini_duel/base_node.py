@@ -11,7 +11,8 @@ from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from std_msgs.msg import Bool, String
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool, Header, String
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -19,7 +20,14 @@ from .arena import ROBOT_IDS, Arena
 from .cmd_vel_arbiter import STOP, VelocityArbiter
 from .peer_sync import HEARTBEAT_PERIOD, MAX_PACKET_BYTES, PeerLink, open_peer_socket
 from .ros_domains import spin_until_shutdown
-from .status import MAX_POSE_AGE, yaw_from_quaternion
+from .status import (
+    MAX_POSE_AGE,
+    MAX_SCAN_AGE,
+    SCAN_TIMEOUT,
+    fresh_stamp,
+    scan_has_valid_ranges,
+    yaw_from_quaternion,
+)
 
 MAX_DATAGRAMS_PER_TICK = 64
 UDP_DRAIN_BUDGET = HEARTBEAT_PERIOD / 10
@@ -50,11 +58,13 @@ class DuelBase(Node):
         self.tf = Buffer(node=self)
         self.listener = TransformListener(self.tf, self)
         self.odometry: tuple[Odometry, float] | None = None
+        self.scan: tuple[Header, float] | None = None
         self.online = False
         self.velocity_pub = self.create_publisher(Twist, "/cmd_vel", 1)
         self.online_pub = self.create_publisher(Bool, "/duel/peer_online", 1)
         self.pose_pub = self.create_publisher(PoseStamped, "/opponent/pose", 1)
         self.create_subscription(Odometry, "/odom", self._odom, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan_filtered", self._scan, qos_profile_sensor_data)
         self.create_subscription(Twist, "/cmd_vel_duel", lambda m: self._command("duel", m), 1)
         self.create_subscription(Twist, "/cmd_vel_nav_out", lambda m: self._command("nav", m), 1)
         self.create_service(SetBool, "~/command_enable", self._enable)
@@ -75,6 +85,9 @@ class DuelBase(Node):
     def _odom(self, message):
         self.odometry = message, time.monotonic()
 
+    def _scan(self, message):
+        self.scan = (message.header, time.monotonic()) if scan_has_valid_ranges(message) else None
+
     def _command(self, source, message):
         try:
             velocity = BodyVelocity(message.linear.x, message.linear.y, message.angular.z)
@@ -85,12 +98,17 @@ class DuelBase(Node):
     def _enable(self, request, response):
         if request.data:
             now = time.monotonic()
+            now_ns = self.get_clock().now().nanoseconds
             if (
                 not self.online or self.link.online(now) is None
-                or self._local_state(self.get_clock().now().nanoseconds, now) is None
+                or self._local_state(now_ns, now) is None
             ):
                 response.success = False
                 response.message = "定位或双向心跳未就绪，恢复后请重新请求使能"
+                return response
+            if not self._scan_fresh(now_ns, now):
+                response.success = False
+                response.message = "雷达数据未就绪，恢复后请重新请求使能"
                 return response
         self.arbiter.enable(request.data)
         if not request.data:
@@ -108,6 +126,15 @@ class DuelBase(Node):
     def _fresh(self, header, now_ns):
         stamp_ns = header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
         return stamp_ns > 0 and -0.05 <= (now_ns - stamp_ns) / 1e9 <= MAX_POSE_AGE
+
+    def _scan_fresh(self, now_ns, now):
+        if self.scan is None:
+            return False
+        header, received = self.scan
+        return (
+            now - received <= SCAN_TIMEOUT
+            and fresh_stamp(header, "laser_frame", now_ns, MAX_SCAN_AGE) is not None
+        )
 
     def _local_state(self, now_ns, now):
         if self.odometry is None:
@@ -158,8 +185,10 @@ class DuelBase(Node):
         now = time.monotonic()
         peer = self.link.online(now) if local is not None else None
         online = peer is not None
-        if not online and self.arbiter.enabled:
+        if self.arbiter.enabled and (not online or not self._scan_fresh(stamp.nanoseconds, now)):
             self.arbiter.enable(False)
+            if online:
+                self.get_logger().warning("雷达数据不可用或超时，已禁用速度输出")
         if online != self.online:
             message = "双向心跳已就绪" if online else "本机定位失效，输出零速"
             if not online and local is not None:

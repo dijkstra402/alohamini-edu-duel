@@ -28,7 +28,8 @@ def _nodes(context, *, simulation):
         raise ValueError("map 必须指向双车共用的地图 YAML 文件")
     arena = Arena.load(arena_path, map_path)
     x, y, yaw = arena.starts[robot_id]
-    params, cleanup = configured_file(model_config("alohamini2edu", "nav2"), "nav2")
+    nav2_params = value("nav2_params") if not simulation else ""
+    params, cleanup = configured_file(nav2_params or model_config("alohamini2edu", "nav2"), "nav2")
     configured = ParameterFile(params, allow_substs=True)
     sim_time = {"use_sim_time": simulation}
     nav_enabled = value("use_nav2").lower() == "true"
@@ -145,7 +146,15 @@ def vehicle_launch(*, simulation):
             DeclareLaunchArgument("use_nav2", default_value="false"),
             DeclareLaunchArgument("radar_diagnostics", default_value="false"),
             DeclareLaunchArgument("use_rviz", default_value="false"),
-            *([DeclareLaunchArgument("start_base", default_value="true")] if simulation else []),
+            *(
+                [DeclareLaunchArgument("start_base", default_value="true")]
+                if simulation
+                else [
+                    DeclareLaunchArgument(
+                        "nav2_params", default_value="", description="本车的完整 Nav2 参数文件",
+                    )
+                ]
+            ),
             OpaqueFunction(function=_nodes, kwargs={"simulation": simulation}),
         ]
     )
