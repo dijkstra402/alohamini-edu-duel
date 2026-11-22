@@ -1,0 +1,36 @@
+name: Humble Ubuntu 失联对照
+on:
+  push:
+    branches:
+      - codex/humble-ubuntu-scheduling-20261122
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 在 Ubuntu ARM64 运行两轮全量和三组验收
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p "$RUNNER_TEMP/humble-evidence"
+          report_dir="$RUNNER_TEMP/humble-evidence"
+          { uname -a; cat /etc/os-release; systemd-detect-virt || true; } > "$report_dir/host.txt"
+          docker build -t duel-humble-ubuntu -f .github/humble-comparison/Dockerfile .github/humble-comparison 2>&1 | tee "$report_dir/image.log"
+          check_rc=0
+          docker run --rm --network none \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/checkout,readonly" \
+            --mount "type=bind,source=$report_dir,target=/verify" \
+            duel-humble-ubuntu bash -c 'bash /runner/repeat-validation.sh; check_rc=$?; chmod -R a+rX /verify; exit "$check_rc"' \
+            2>&1 | tee "$report_dir/humble.log" || check_rc=$?
+          exit "$check_rc"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: humble-ubuntu-arm64-evidence
+          path: ${{ runner.temp }}/humble-evidence
+          retention-days: 14

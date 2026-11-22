@@ -385,9 +385,9 @@ def test_heartbeat_confirmation_expires_from_original_send_time(arena):
     a, b = (PeerLink(robot, arena) for robot in ROBOT_IDS)
     for index in range(4):
         exchange(a, b, index * 0.05)
-    assert a.online(0.39) is not None
+    assert a.online(0.249) is not None
     # 最近接收的是 0.15 秒的位姿，确认对应 0.10 秒发送的报文。
-    assert a.online(0.41) is None
+    assert a.online(0.251) is None
 
     b.accept(a.encode(POSE_A, 0.0, 0.0, 0.2), 0.2)
     delayed = b.encode(POSE_B, 0.0, 0.0, 0.2)
@@ -513,7 +513,7 @@ def test_base_revokes_motion_permission_until_explicit_reenable(
     if lose_pose:
         base.odometry = None
     if not lose_pose:
-        base.link.acked_sent_at = -math.inf
+        base.link.acked_sent_at = time.monotonic() - 0.17
     assert not base._enable(request, SetBool.Response()).success
     base._tick()
     if not lose_pose:

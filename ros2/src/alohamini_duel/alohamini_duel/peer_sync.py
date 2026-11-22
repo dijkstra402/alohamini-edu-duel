@@ -10,8 +10,10 @@ from dataclasses import dataclass
 from .arena import ROBOT_IDS, Arena, Pose, coordinates
 
 PEER_TIMEOUT = 0.5
-LINK_STOP_TIMEOUT = 0.30
-HEARTBEAT_PERIOD = 0.05
+# 为碰撞监测转发、实车制动和轮速反馈留出停稳预算。
+LINK_STOP_TIMEOUT = 0.15
+# 在短运动许可内保留足够的双向确认次数。
+HEARTBEAT_PERIOD = 0.025
 MAX_PACKET_BYTES = 1024
 
 
